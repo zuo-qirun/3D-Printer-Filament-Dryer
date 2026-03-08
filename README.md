@@ -1,127 +1,153 @@
-﻿# 3D 打印耗材烘干箱（ESP32-S3）
+# 3D 打印耗材烘干箱（ESP32-S3）
 
-一个基于 ESP32-S3 的四盘位耗材烘干箱项目。系统通过 PTC 加热片 + 12V 风扇形成热风循环，结合温湿度闭环控制，实现稳定烘干。
+本项目用于四盘位 3D 打印耗材烘干箱控制。  
+核心方案：`PTC 加热片 + 12V 风扇 + AHT10 温湿度传感器 + OLED + ESP32-S3`，实现温湿度监测、闭环控温、任务计时和本地/网页控制。
 
-## 主要功能
+## 程序介绍
 
-- 四盘位耗材烘干（目标支持 4 卷料同时烘干）
-- AHT10 温湿度采集（I2C `0x38`）
-- OLED 实时显示（I2C `0x78`，即 7-bit `0x3C`）
-- PID 自动调温（目标温度可调）
-- PID 自动校准（继电振荡法）
-- 风扇策略控制（按工况动态调速）
-- 安全保护（传感器故障/超温）
-- 断电恢复（NVS 持久化）
-- 数据记录（SPIFFS `dryer_log.csv`）
-- 五键菜单（上/下/左/右/中）
+### 1. 核心功能
 
-## 硬件接线
+- 温湿度采集：AHT10（I2C `0x38`）
+- OLED 显示：SSD1306（8-bit 地址 `0x78`，等效 7-bit `0x3C`）
+- PID 自动调温：按目标温度闭环控制加热输出
+- PID 自动校准：继电振荡法（Auto Tune）
+- 安全保护：传感器故障、超温故障
+- 故障清除：本地菜单、串口、网页均可 `faultreset`
+- 材料预设：内置常见耗材温度/时长参数
+- 用户自定义：目标温度、时长、空闲风扇转速可改
+- 断电恢复：保存运行状态，重启后可继续任务
+- 数据记录：SPIFFS 中持续写入 `dryer_log.csv`
 
-### 1) 传感器与显示
+### 2. 控制方式
 
-- `GPIO8` -> I2C SDA（AHT10 SDA + OLED SDA）
-- `GPIO9` -> I2C SCL（AHT10 SCL + OLED SCL）
-- `3V3` -> AHT10 VCC
-- `GND` -> AHT10 GND + OLED GND
+- 本地五键：上/下/左/右/中
+- 串口命令：`help/start/stop/status/faultreset/autotune/...`
+- 网页控制（局域网）：
+  - 实时状态与曲线（温度/湿度/风扇/加热）
+  - 修改目标温度、时长、参数模式、PID
+  - 启动/停止/故障清除/PID 校准
+  - Wi-Fi 配置（STA）
+- 开发人员选项（网页隐藏入口）：
+  - 连续点击标题 5 次显示/隐藏
+  - 支持发送模拟串口指令并查看回显
+  - 支持虚拟五键（上/下/左/右/中）
 
-### 2) PTC 加热（12V，MOSFET 低边）
+### 3. 网络逻辑
 
-- `GPIO4` -> MOSFET Gate（建议串 `100R`）
-- Gate -> `10k` 下拉到 GND
-- `12V+` -> PTC+
-- `PTC-` -> MOSFET Drain
-- MOSFET Source -> GND
-- 必须共地：ESP32 GND 与 12V GND
+- 若已保存 Wi-Fi：优先 STA 联网
+- 未保存或联网失败：自动进入 AP 配网模式
+  - AP SSID：`Dryer-Config`
+  - AP 密码：`12345678`
+  - 默认 IP：`192.168.4.1`
+- OLED 会显示当前网络状态，避免黑屏
 
-### 3) 风扇（12V 四线）
+## 硬件需求
 
-- `GPIO5` -> 风扇 PWM 控制输入
-- 风扇供电使用 12V
-- 风扇 GND 与 ESP32 共地
+### 1. 主控与外设
 
-### 4) 五键按键（默认低电平按下，`INPUT_PULLUP`）
+- ESP32-S3 开发板（示例：`esp32-s3-devkitm-1`）
+- AHT10 温湿度传感器（I2C）
+- 0.96" OLED（SSD1306 I2C）
+- 五向按键模块（或 5 个独立按键）
 
-- 上键：`GPIO10`
-- 下键：`GPIO11`
-- 左键：`GPIO12`
-- 右键：`GPIO13`
-- 中键：`GPIO14`
+### 2. 执行器与电源
 
-## 菜单与按键逻辑
+- 12V PTC 加热片（示例：100W）
+- 12V 风扇（支持 PWM 调速更佳）
+- 逻辑级 N 沟道 MOSFET（加热低边开关）
+- 电源：
+  - 12V 电源（满足加热片与风扇电流）
+  - ESP32 供电（可由 5V/USB 或降压模块提供）
 
-- 主界面
-- `中键` 进入菜单
-- `左/右` 切换温度/湿度主页显示
-- `上/下` 快速微调目标温度
+### 3. 推荐电气元件
 
-- 菜单项
-- 启动/停止
-- 目标温度
-- 烘干时长
-- 材料预设（已扩展为 Bambu 指南常见材料）
-- PID 参数（Kp/Ki/Kd）
-- PID 自校准
-- 清除故障
+- MOSFET Gate 串联电阻：约 `100R`
+- MOSFET Gate 下拉电阻：约 `10k` 到 GND
+- 端子台、保险丝、线材、必要散热措施
+- 强烈建议：独立过温保护（温控开关/热熔断）
 
-## 已内置耗材预设（基于 Bambu 指南）
+### 4. 引脚连接（当前程序默认）
 
-- PLA（55C / 8h）
-- PETG_HF（65C / 8h）
-- ABS（80C / 8h）
-- ABS_GF（80C / 8h）
-- ASA（80C / 8h）
-- PC（80C / 8h）
-- TPU95A_HF（70C / 8h）
-- PLA_CF（55C / 8h）
-- PETG_CF（65C / 8h）
-- PET_CF（80C / 10h）
-- PAHT_CF（80C / 10h）
-- PA6_CF（80C / 10h）
-- PA6_GF（80C / 10h）
-- PPA_CF（100C / 10h）
-- PPS_CF（100C / 10h）
+- I2C SDA：`GPIO8`（AHT10 + OLED）
+- I2C SCL：`GPIO9`（AHT10 + OLED）
+- 加热控制：`GPIO4`（MOSFET Gate）
+- 风扇 PWM：`GPIO5`
+- 按键：
+  - 上：`GPIO10`
+  - 下：`GPIO11`
+  - 左：`GPIO12`
+  - 右：`GPIO13`
+  - 中：`GPIO14`
 
-## PID 自动校准说明
+> 注意：ESP32 GND 与 12V 侧 GND 必须共地。
 
-当前实现为继电振荡法（Relay Auto-Tune）：
+## 使用方法
 
-- 在目标温度附近做上下阈值振荡
-- 采集振荡幅值和周期
-- 估算临界参数并自动生成 `Kp/Ki/Kd`
+### 1. 编译与烧录
 
-建议：
+```bash
+pio run
+pio run -t upload
+pio device monitor -b 115200
+```
 
-- 校准时箱体尽量保持稳定（避免开盖、强气流扰动）
-- 校准前让系统先预热到接近目标温度
+### 2. 上电后的首次使用
 
-## 串口命令
+1. 上电后设备尝试连接已保存 Wi-Fi。  
+2. 若未连接成功，设备会自动开启 AP 配网热点。  
+3. 手机/电脑连接 `Dryer-Config`，访问 `192.168.4.1`。  
+4. 在网页输入路由器 SSID/密码并保存。  
+5. 联网成功后，通过设备 IP 访问控制页面。
+
+### 3. 本地按键操作
+
+- 主界面：
+  - 中键：进入菜单
+  - 左/右：切换温度/湿度显示页
+  - 上/下：微调目标温度
+- 菜单项：
+  - 启动/停止
+  - 目标温度
+  - 烘干时长
+  - 空闲风扇
+  - 自定义参数
+  - 材料预设
+  - PID 参数
+  - PID 自校准
+  - 清除故障
+
+### 4. 串口命令
 
 - `help`
 - `start`
 - `stop`
-- `preset <PLA|PETG|ABS|NYLON>`
+- `preset <name>`（如 `preset PLA`）
 - `status`
 - `faultreset`
 - `autotune`
+- `wifistatus`
+- `wifiap`
+- `wificlear`
+- `btn <up|down|left|right|ok>`（模拟按键）
 
-## 数据记录
+### 5. 网页端使用
 
-日志文件：`/dryer_log.csv`（SPIFFS）
+- 首页查看实时状态与曲线
+- 控制区可设置：
+  - 参数模式（`user` / 材料预设）
+  - 目标温度
+  - 烘干时长
+  - 空闲风扇转速
+- PID 区可保存参数、恢复默认、自动校准
+- 可执行启动、停止、故障清除
 
-字段：
+## 数据与文件
 
-- `ms`
-- `temp_c`
-- `humidity`
-- `target_c`
-- `heater_pct`
-- `fan_pct`
-- `active`
-- `fault`
-- `preset`
-- `remaining_s`
+- 日志文件：`/dryer_log.csv`（SPIFFS）
+- 主要字段：
+  - `ms,temp_c,humidity,target_c,heater_pct,fan_pct,active,fault,preset,remaining_s`
 
-## 代码结构
+## 目录结构
 
 ```text
 .
@@ -132,19 +158,3 @@
 `- README.md
 ```
 
-## 构建与烧录
-
-```bash
-pio run
-pio run -t upload
-pio device monitor -b 115200
-```
-
-## 建议烘干温度参考（需实测修正）
-
-- PLA: 45-55 C
-- PETG: 60-65 C
-- ABS: 65-75 C
-- NYLON: 70-85 C
-
-> 注意：不同品牌耗材耐温差异较大，请从较低温度开始验证。

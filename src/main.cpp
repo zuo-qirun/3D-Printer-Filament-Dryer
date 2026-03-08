@@ -258,8 +258,11 @@ static void handleApiStatus();
 static void handleApiPresets();
 static void handleApiControl();
 static void handleApiWifi();
+static void handleApiDevcmd();
 static void handleNotFound();
 static void serviceNetwork();
+static String executeConsoleCommand(const String& cmdLine);
+static void handleButtonEvents(bool up, bool down, bool left, bool right, bool ok);
 
 // 主要功能：根据预设索引查询其所属材料组。
 // 使用方法：用于预设菜单分组筛选与显示。
@@ -424,12 +427,14 @@ static void handleWebRoot() {
 .kv{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:10px}
 .k{font-size:12px;color:var(--sub)}.v{font-size:20px;font-weight:700}
 .panel h2{margin:0 0 10px 0;font-size:17px}.row{display:flex;gap:8px}.row button{flex:1}
-label{display:block;margin:8px 0 4px;font-size:13px}input,select,button{width:100%;padding:9px;border:1px solid #cbd5e1;border-radius:8px;background:#fff}
+label{display:block;margin:8px 0 4px;font-size:13px}input,select,button,textarea{width:100%;padding:9px;border:1px solid #cbd5e1;border-radius:8px;background:#fff}
 canvas{width:100%;height:170px;background:#fff;border:1px solid var(--line);border-radius:10px}
 .ok{color:var(--good)}.bad{color:var(--bad)}
+.devtip{font-size:12px;color:#94a3b8;user-select:none;cursor:pointer}
+textarea{font-family:Consolas,"Courier New",monospace;resize:vertical}
 @media (max-width:1100px){.span6,.span4,.span3{grid-column:span 12}.kpi{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style></head><body><div class="wrap">
-<div class="head"><h1>3D打印耗材烘干箱</h1><div id="net" class="sub">网络状态加载中...</div></div>
+<div class="head"><h1 id="titleMain">3D打印耗材烘干箱</h1><div id="net" class="sub">网络状态加载中...</div></div>
 <div class="dash">
   <div class="card span12">
     <div class="kpi">
@@ -450,7 +455,7 @@ canvas{width:100%;height:170px;background:#fff;border:1px solid var(--line);bord
     <label>烘干时长 (分钟)</label><input id="setDur" type="number" min="30" max="1440">
     <label>空闲风扇转速 (0~100 %)</label><input id="setIdleFan" type="number" min="0" max="100">
     <div id="presetWrap"><label>材料预设</label><select id="presetSel" onchange="onPresetChange()"></select></div>
-    <div class="row" style="margin-top:10px"><button onclick="sendCtrl('start')">启动</button><button onclick="sendCtrl('stop')">停止</button><button onclick="applyCfg()">应用</button></div>
+    <div class="row" style="margin-top:10px"><button onclick="sendCtrl('start')">启动</button><button onclick="sendCtrl('stop')">停止</button><button onclick="sendCtrl('faultreset')">清除故障</button><button onclick="applyCfg()">应用</button></div>
   </div>
   <div class="card span4 panel"><h2>PID</h2>
     <label>Kp</label><input id="setKp" type="number" step="0.001" min="0" max="10">
@@ -465,13 +470,48 @@ canvas{width:100%;height:170px;background:#fff;border:1px solid var(--line);bord
     <button style="margin-top:10px" onclick="saveWifi()">保存并连接</button>
     <div class="sub" style="margin-top:8px">AP模式: Dryer-Config / 12345678 / 192.168.4.1</div>
   </div>
+  <div id="devPanel" class="card span12 panel" style="display:none">
+    <h2>开发人员选项</h2>
+    <div class="sub">可模拟串口命令并查看回显，支持 help/start/stop/status/faultreset 等。</div>
+    <label>虚拟按键</label>
+    <div class="row">
+      <button onclick="sendDevKey('up')">上</button>
+      <button onclick="sendDevKey('down')">下</button>
+      <button onclick="sendDevKey('left')">左</button>
+      <button onclick="sendDevKey('right')">右</button>
+      <button onclick="sendDevKey('ok')">中</button>
+    </div>
+    <label>命令输入</label>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="devCmd" type="text" placeholder="例如: help" style="flex:1">
+      <button style="width:120px;min-width:120px" onclick="sendDevCmd()">发送</button>
+    </div>
+    <label>命令回显</label>
+    <textarea id="devLog" rows="10" readonly></textarea>
+    <div class="devtip" id="devHint">隐藏入口：连续点击页面标题 5 次可显示/隐藏本面板</div>
+  </div>
 </div>
 <script>
 const HIS=180,hs={t:[],h:[],f:[],p:[]};
 let uiInited=false,lastPresetIndex=-1,forceParamSync=true,forcePidSync=true;
+let devTapCount=0,devLastTapMs=0,devPanelShown=false;
 async function jget(u){const r=await fetch(u);return await r.json();}
 async function jpost(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});return await r.json();}
 function setText(id,v){document.getElementById(id).textContent=v;}
+function appendDevLog(msg){const box=document.getElementById('devLog');if(!box)return;box.value+=msg+'\n';box.scrollTop=box.scrollHeight;}
+function toggleDevPanel(forceShow){
+  const panel=document.getElementById('devPanel');
+  devPanelShown=(typeof forceShow==='boolean')?forceShow:(!devPanelShown);
+  panel.style.display=devPanelShown?'block':'none';
+  appendDevLog(devPanelShown?'[系统] 开发人员选项已开启':'[系统] 开发人员选项已隐藏');
+}
+function onTitleClick(){
+  const now=Date.now();
+  if(now-devLastTapMs>1800) devTapCount=0;
+  devLastTapMs=now;
+  devTapCount++;
+  if(devTapCount>=5){devTapCount=0;toggleDevPanel();}
+}
 function push(arr,v){arr.push(v);if(arr.length>HIS)arr.shift();}
 function updateModeUi(){const mode=document.getElementById('modeSel').value;document.getElementById('presetWrap').style.display=(mode==='preset')?'block':'none';}
 async function onModeChange(){
@@ -556,6 +596,30 @@ async function applyCfg(){const mode=document.getElementById('modeSel').value;co
 async function applyPid(){const payload={pid_kp:parseFloat(document.getElementById('setKp').value),pid_ki:parseFloat(document.getElementById('setKi').value),pid_kd:parseFloat(document.getElementById('setKd').value)};await jpost('/api/control',payload);forcePidSync=true;await refresh();}
 async function sendCtrl(cmd){await jpost('/api/control',{cmd});if(cmd==='pidreset'){forcePidSync=true;}await refresh();}
 async function saveWifi(){await jpost('/api/wifi',{ssid:document.getElementById('ssid').value,password:document.getElementById('pass').value});}
+async function sendDevCmd(){
+  const input=document.getElementById('devCmd');
+  const cmd=input.value.trim();
+  if(!cmd) return;
+  appendDevLog('> '+cmd);
+  try{
+    const r=await jpost('/api/devcmd',{cmd});
+    if(r&&typeof r.output==='string'){
+      appendDevLog(r.output.replace(/\n$/,''));
+    }else{
+      appendDevLog('[系统] 无回显数据');
+    }
+  }catch(e){
+    appendDevLog('[错误] 指令发送失败');
+  }
+  input.value='';
+}
+async function sendDevKey(k){
+  await jpost('/api/devcmd',{cmd:'btn '+k});
+  appendDevLog('> btn '+k);
+  await refresh();
+}
+document.getElementById('titleMain').addEventListener('click',onTitleClick);
+document.getElementById('devCmd').addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();sendDevCmd();}});
 loadPresets().then(refresh);setInterval(refresh,1000);
 </script></body></html>)HTML";
   g_webServer.send(200, "text/html; charset=utf-8", PAGE);
@@ -745,6 +809,33 @@ static void handleApiWifi() {
   g_webServer.send(200, "application/json", "{\"ok\":true,\"msg\":\"WiFi连接成功\"}");
 }
 
+// 主要功能：开发人员调试接口，模拟串口命令并返回回显。
+// 使用方法：POST /api/devcmd，JSON 字段 cmd（如 help/start/status）。
+static void handleApiDevcmd() {
+  JsonDocument in;
+  DeserializationError err = deserializeJson(in, g_webServer.arg("plain"));
+  if (err || !in["cmd"].is<const char*>()) {
+    g_webServer.send(400, "application/json", "{\"ok\":false,\"msg\":\"cmd不能为空\"}");
+    return;
+  }
+
+  String cmd = in["cmd"].as<String>();
+  cmd.trim();
+  if (cmd.length() == 0) {
+    g_webServer.send(400, "application/json", "{\"ok\":false,\"msg\":\"cmd不能为空\"}");
+    return;
+  }
+
+  String outText = executeConsoleCommand(cmd);
+  JsonDocument out;
+  out["ok"] = true;
+  out["echo"] = cmd;
+  out["output"] = outText;
+  String resp;
+  serializeJson(out, resp);
+  g_webServer.send(200, "application/json; charset=utf-8", resp);
+}
+
 // 主要功能：404 兜底处理，在 AP 模式下引导到首页。
 // 使用方法：WebServer 未命中路由时自动调用。
 static void handleNotFound() {
@@ -764,6 +855,7 @@ static void startWebServer() {
   g_webServer.on("/api/presets", HTTP_GET, handleApiPresets);
   g_webServer.on("/api/control", HTTP_POST, handleApiControl);
   g_webServer.on("/api/wifi", HTTP_POST, handleApiWifi);
+  g_webServer.on("/api/devcmd", HTTP_POST, handleApiDevcmd);
   g_webServer.onNotFound(handleNotFound);
   g_webServer.begin();
   Serial.println("Web 服务器已启动（80端口）。");
@@ -996,27 +1088,26 @@ static bool pollButtonPressed(ButtonId id) {
   return false;
 }
 
-// 主要功能：处理串口命令（保留调试与远程控制）。
-// 使用方法：loop 中周期调用。
-static void processSerialCommands() {
-  if (!Serial.available()) return;
-  String cmd = Serial.readStringUntil('\n');
+// 主要功能：执行一条控制台命令并返回文本回显。
+// 使用方法：串口与 Web 调试接口共用，传入完整命令行字符串。
+static String executeConsoleCommand(const String& cmdLine) {
+  String cmd = cmdLine;
   cmd.trim();
-  if (cmd.length() == 0) return;
+  if (cmd.length() == 0) return "";
 
   String lower = cmd;
   lower.toLowerCase();
+
   if (lower == "help") {
-    Serial.println("命令：help | start | stop | preset <name> | status | faultreset | autotune | wifistatus | wifiap | wificlear");
-    return;
+    return "命令：help | start | stop | preset <name> | status | faultreset | autotune | wifistatus | wifiap | wificlear | btn <up|down|left|right|ok>\n";
   }
   if (lower == "start") {
     startDrying();
-    return;
+    return "开始烘干。\n";
   }
   if (lower == "stop") {
     stopDrying();
-    return;
+    return "已停止烘干。\n";
   }
   if (lower.startsWith("preset ")) {
     String name = cmd.substring(7);
@@ -1024,61 +1115,92 @@ static void processSerialCommands() {
     if (idx >= 0) {
       applyPreset(static_cast<size_t>(idx));
       saveState(true);
-      Serial.print("已设置预设：");
-      Serial.println(activePreset().name);
-    } else {
-      Serial.println("未知材料预设。");
+      return String("已设置预设：") + activePreset().name + "\n";
     }
-    return;
+    return "未知材料预设。\n";
   }
   if (lower == "faultreset") {
     clearFaults();
-    Serial.println("故障已清除。");
     saveState(true);
-    return;
+    return "故障已清除。\n";
   }
   if (lower == "status") {
-    Serial.printf("预设:%s 运行:%u 温度:%.2fC 湿度:%.2f%% 目标:%.1fC 加热:%u%% 风扇:%u%% 故障:%lu 剩余:%lu\n",
-                  currentProfileName(), g_dryingActive ? 1 : 0, g_smoothTempC, g_smoothHumi,
-                  g_targetTempC, RatioToPct(g_heaterDemand), g_fanPct,
-                  static_cast<unsigned long>(g_faultFlags), static_cast<unsigned long>(g_remainingSec));
-    return;
+    char line[196];
+    snprintf(line, sizeof(line),
+             "预设:%s 运行:%u 温度:%.2fC 湿度:%.2f%% 目标:%.1fC 加热:%u%% 风扇:%u%% 故障:%lu 剩余:%lu\n",
+             currentProfileName(), g_dryingActive ? 1 : 0, g_smoothTempC, g_smoothHumi, g_targetTempC,
+             RatioToPct(g_heaterDemand), g_fanPct, static_cast<unsigned long>(g_faultFlags),
+             static_cast<unsigned long>(g_remainingSec));
+    return String(line);
   }
   if (lower == "autotune") {
+    if (!g_sensorOk) {
+      return "PID自校准失败：传感器不可用。\n";
+    }
     startPidAutoTune();
-    return;
+    return "PID自校准已启动（继电振荡法）。\n";
   }
   if (lower == "wifistatus") {
-    Serial.printf("WiFi:%s AP:%u IP:%s SSID:%s\n",
-                  g_wifiConnected ? "已连接" : "未连接", g_apConfigMode ? 1 : 0,
-                  g_wifiConnected ? WiFi.localIP().toString().c_str() : WiFi.softAPIP().toString().c_str(),
-                  g_wifiConnected ? WiFi.SSID().c_str() : "(none)");
-    return;
+    char line[160];
+    snprintf(line, sizeof(line), "WiFi:%s AP:%u IP:%s SSID:%s\n", g_wifiConnected ? "已连接" : "未连接",
+             g_apConfigMode ? 1 : 0,
+             g_wifiConnected ? WiFi.localIP().toString().c_str() : WiFi.softAPIP().toString().c_str(),
+             g_wifiConnected ? WiFi.SSID().c_str() : "(none)");
+    return String(line);
   }
   if (lower == "wifiap") {
     startConfigApPortal();
-    Serial.println("已切换到 AP 配网模式。");
-    return;
+    return "已切换到 AP 配网模式。\n";
   }
   if (lower == "wificlear") {
     clearWifiConfig();
     WiFi.disconnect(true, true);
     startConfigApPortal();
-    Serial.println("WiFi 凭据已清除，已进入 AP 配网模式。");
-    return;
+    return "WiFi 凭据已清除，已进入 AP 配网模式。\n";
   }
-  Serial.println("未知命令，请输入 help 查看帮助。");
+  if (lower.startsWith("btn ")) {
+    String key = lower.substring(4);
+    key.trim();
+    if (key == "up") {
+      handleButtonEvents(true, false, false, false, false);
+      return "虚拟按键：UP\n";
+    }
+    if (key == "down") {
+      handleButtonEvents(false, true, false, false, false);
+      return "虚拟按键：DOWN\n";
+    }
+    if (key == "left") {
+      handleButtonEvents(false, false, true, false, false);
+      return "虚拟按键：LEFT\n";
+    }
+    if (key == "right") {
+      handleButtonEvents(false, false, false, true, false);
+      return "虚拟按键：RIGHT\n";
+    }
+    if (key == "ok" || key == "center" || key == "middle") {
+      handleButtonEvents(false, false, false, false, true);
+      return "虚拟按键：OK\n";
+    }
+    return "按键参数错误，用法：btn <up|down|left|right|ok>\n";
+  }
+  if (lower == "up" || lower == "down" || lower == "left" || lower == "right" || lower == "ok") {
+    return executeConsoleCommand(String("btn ") + lower);
+  }
+  return "未知命令，请输入 help 查看帮助。\n";
 }
 
-// 主要功能：五键菜单交互逻辑。
-// 使用方法：loop 中调用，处理菜单切换、温度/PID 参数调整、启停等。
-static void processButtonUi() {
-  bool up = pollButtonPressed(BTN_UP);
-  bool down = pollButtonPressed(BTN_DOWN);
-  bool left = pollButtonPressed(BTN_LEFT);
-  bool right = pollButtonPressed(BTN_RIGHT);
-  bool ok = pollButtonPressed(BTN_OK);
+// 主要功能：处理串口命令（保留调试与远程控制）。
+// 使用方法：loop 中周期调用。
+static void processSerialCommands() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  String out = executeConsoleCommand(cmd);
+  if (out.length() > 0) Serial.print(out);
+}
 
+// 主要功能：处理一次按键事件（来自实体按键或虚拟按键）。
+// 使用方法：将本次触发的按键置为 true，其余置 false。
+static void handleButtonEvents(bool up, bool down, bool left, bool right, bool ok) {
   if (!(up || down || left || right || ok)) return;
 
   if (g_uiMode == UI_HOME) {
@@ -1259,6 +1381,17 @@ static void processButtonUi() {
   }
 }
 
+// 主要功能：五键菜单交互逻辑。
+// 使用方法：loop 中调用，处理菜单切换、温度/PID 参数调整、启停等。
+static void processButtonUi() {
+  bool up = pollButtonPressed(BTN_UP);
+  bool down = pollButtonPressed(BTN_DOWN);
+  bool left = pollButtonPressed(BTN_LEFT);
+  bool right = pollButtonPressed(BTN_RIGHT);
+  bool ok = pollButtonPressed(BTN_OK);
+  handleButtonEvents(up, down, left, right, ok);
+}
+
 // 主要功能：PID 自动调温计算。
 // 使用方法：在控制周期调用，输出 0~1 加热需求。
 static void updatePidControl() {
@@ -1405,37 +1538,42 @@ static void drawScreen() {
     oled.drawStr(0, 61, line3);
   } else if (g_uiMode == UI_MENU) {
     const char* items[] = {"启动/停止", "目标温度", "烘干时长", "空闲风扇", "自定义参数", "材料预设", "PID参数", "PID自校准", "清除故障"};
+    oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "菜单");
     uint8_t startIdx = (g_menuIndex > 2) ? static_cast<uint8_t>(g_menuIndex - 2) : 0;
     if (startIdx > 5) startIdx = 5;  // 9项菜单显示窗口(4行)
     for (uint8_t i = 0; i < 4; ++i) {
       uint8_t idx = startIdx + i;
-      if (idx >= 7) break;
+      if (idx >= 9) break;
       char row[28];
       snprintf(row, sizeof(row), "%c %s", (idx == g_menuIndex ? '>' : ' '), items[idx]);
       oled.drawUTF8(0, 24 + i * 10, row);
     }
   } else if (g_uiMode == UI_SET_TEMP) {
+    oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "设定目标温度");
     char t[24];
     snprintf(t, sizeof(t), "T=%.1fC", g_targetTempC);
     oled.setFont(u8g2_font_logisoso24_tf);
     oled.drawStr(0, 52, t);
   } else if (g_uiMode == UI_SET_TIME) {
+    oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "设定烘干时长");
     char d[16];
     FormatDuration(g_configDurationSec, d, sizeof(d));
     oled.setFont(u8g2_font_logisoso18_tf);
     oled.drawStr(0, 52, d);
   } else if (g_uiMode == UI_SET_IDLE_FAN) {
+    oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "设定空闲风扇");
     char f[24];
     snprintf(f, sizeof(f), "FAN=%u%%", g_idleFanPct);
     oled.setFont(u8g2_font_logisoso18_tf);
     oled.drawStr(0, 52, f);
   } else if (g_uiMode == UI_SET_PRESET) {
+    oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "选择材料预设");
-    oled.setFont(u8g2_font_6x12_tf);
+    oled.setFont(u8g2_font_wqy12_t_gb2312);
     char gline[24];
     snprintf(gline, sizeof(gline), "组:%s", PRESET_GROUP_NAMES[g_presetGroupFilter]);
     oled.drawUTF8(0, 24, gline);
@@ -1446,6 +1584,7 @@ static void drawScreen() {
     oled.setFont(u8g2_font_6x12_tf);
     oled.drawStr(0, 56, p);
   } else if (g_uiMode == UI_SET_PID) {
+    oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "PID参数");
     char l1[24];
     char l2[24];

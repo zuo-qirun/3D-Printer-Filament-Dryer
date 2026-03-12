@@ -1,0 +1,41 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "FilamentDryerMonitor/1.0.0": {
+        "dependencies": {
+          "MQTTnet": "5.1.0.1559"
+        },
+        "runtime": {
+          "FilamentDryerMonitor.dll": {}
+        }
+      },
+      "MQTTnet/5.1.0.1559": {
+        "runtime": {
+          "lib/net10.0/MQTTnet.dll": {
+            "assemblyVersion": "5.1.0.1559",
+            "fileVersion": "5.1.0.1559"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "FilamentDryerMonitor/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "MQTTnet/5.1.0.1559": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-9mkk0H+76CToIzp9ru5Uj5BuC3P5hQdkhvXM+CLmmTDdZWqajjICCHuUMbDd1yVBt9BWL77Rvzt0A+/PA4WMCA==",
+      "path": "mqttnet/5.1.0.1559",
+      "hashPath": "mqttnet.5.1.0.1559.nupkg.sha512"
+    }
+  }
+}

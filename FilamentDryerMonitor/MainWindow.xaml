@@ -1,0 +1,161 @@
+﻿<Window x:Class="FilamentDryerMonitor.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        Title="3D Printer Filament Dryer Monitor"
+        MinHeight="680"
+        MinWidth="980"
+        Height="740"
+        Width="1180"
+        Background="#FF0F172A">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Padding="14" CornerRadius="12" Background="#FF111827" BorderBrush="#FF374151" BorderThickness="1">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <DockPanel Grid.Row="0" LastChildFill="True">
+                    <StackPanel Orientation="Horizontal" DockPanel.Dock="Left" VerticalAlignment="Center">
+                        <TextBlock Text="ESP32 地址" Foreground="#FFE5E7EB" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        <TextBox Name="AddressTextBox"
+                                 Width="220"
+                                 Margin="12,0,0,0"
+                                 Text="192.168.4.1"
+                                 Background="#FF1F2937"
+                                 Foreground="#FFF9FAFB"
+                                 BorderBrush="#FF4B5563"
+                                 VerticalContentAlignment="Center"/>
+                        <Button Name="ConnectButton"
+                                Content="连接 LAN"
+                                Margin="10,0,0,0"
+                                Padding="14,8"
+                                Click="ConnectButton_Click"/>
+                        <Button Name="DisconnectButton"
+                                Content="断开 LAN"
+                                Margin="8,0,0,0"
+                                Padding="14,8"
+                                Click="DisconnectButton_Click"
+                                IsEnabled="False"/>
+                    </StackPanel>
+                    <TextBlock Name="ConnectionStateText"
+                               Text="LAN: 未连接"
+                               Foreground="#FFF59E0B"
+                               FontWeight="Bold"
+                               VerticalAlignment="Center"
+                               HorizontalAlignment="Right"/>
+                </DockPanel>
+
+                <Grid Grid.Row="1" Margin="0,12,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="120"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="84"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="240"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="200"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="200"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <TextBlock Grid.Column="0" Text="MQTT" Foreground="#FFE5E7EB" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                    <TextBox Grid.Column="1" Name="MqttHostTextBox" Margin="8,0,0,0" Text="bemfa.com" Background="#FF1F2937" Foreground="#FFF9FAFB" BorderBrush="#FF4B5563"/>
+                    <TextBox Grid.Column="3" Name="MqttPortTextBox" Margin="8,0,0,0" Text="9501" Background="#FF1F2937" Foreground="#FFF9FAFB" BorderBrush="#FF4B5563"/>
+                    <TextBox Grid.Column="5" Name="MqttKeyTextBox" Margin="8,0,0,0" Text="84810b9b5f5245fdbc1e1738837f27a9" Background="#FF1F2937" Foreground="#FFF9FAFB" BorderBrush="#FF4B5563"/>
+                    <TextBox Grid.Column="7" Name="MqttStatusTopicTextBox" Margin="8,0,0,0" Text="dryer/esp32/status" Background="#FF1F2937" Foreground="#FFF9FAFB" BorderBrush="#FF4B5563"/>
+                    <TextBox Grid.Column="9" Name="MqttControlTopicTextBox" Margin="8,0,0,0" Text="dryer/esp32/control" Background="#FF1F2937" Foreground="#FFF9FAFB" BorderBrush="#FF4B5563"/>
+
+                    <StackPanel Grid.Column="10" Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button Name="MqttConnectButton" Content="连接 MQTT" Margin="10,0,0,0" Padding="14,8" Click="MqttConnectButton_Click"/>
+                        <Button Name="MqttDisconnectButton" Content="断开 MQTT" Margin="8,0,0,0" Padding="14,8" Click="MqttDisconnectButton_Click" IsEnabled="False"/>
+                        <TextBlock Name="MqttStateText" Text="MQTT: 未连接" Foreground="#FFF59E0B" FontWeight="Bold" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Grid>
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="1" Margin="0,12,0,0" Padding="14" CornerRadius="12" Background="#FF111827" BorderBrush="#FF374151" BorderThickness="1">
+            <UniformGrid Columns="4">
+                <StackPanel Margin="0,0,8,0">
+                    <TextBlock Text="当前温度" Foreground="#FF9CA3AF"/>
+                    <TextBlock Name="TempText" Text="--.- C" Foreground="#FF93C5FD" FontSize="28" FontWeight="Bold"/>
+                </StackPanel>
+                <StackPanel Margin="0,0,8,0">
+                    <TextBlock Text="当前湿度" Foreground="#FF9CA3AF"/>
+                    <TextBlock Name="HumiText" Text="--.- %" Foreground="#FF86EFAC" FontSize="28" FontWeight="Bold"/>
+                </StackPanel>
+                <StackPanel Margin="0,0,8,0">
+                    <TextBlock Text="目标温度" Foreground="#FF9CA3AF"/>
+                    <TextBlock Name="TargetText" Text="--.- C" Foreground="#FFFDE68A" FontSize="28" FontWeight="Bold"/>
+                </StackPanel>
+                <StackPanel>
+                    <TextBlock Text="剩余时间" Foreground="#FF9CA3AF"/>
+                    <TextBlock Name="RemainingText" Text="--:--:--" Foreground="#FFFCA5A5" FontSize="28" FontWeight="Bold"/>
+                </StackPanel>
+            </UniformGrid>
+        </Border>
+
+        <Border Grid.Row="2" Margin="0,12,0,0" Padding="14" CornerRadius="12" Background="#FF111827" BorderBrush="#FF374151" BorderThickness="1">
+            <DockPanel LastChildFill="False">
+                <WrapPanel DockPanel.Dock="Left">
+                    <Button Content="启动烘干" Padding="14,8" Margin="0,0,8,0" Click="StartButton_Click"/>
+                    <Button Content="停止烘干" Padding="14,8" Margin="0,0,8,0" Click="StopButton_Click"/>
+                    <Button Content="清除故障" Padding="14,8" Margin="0,0,8,0" Click="FaultResetButton_Click"/>
+                    <Button Content="PID 自整定" Padding="14,8" Click="AutoTuneButton_Click"/>
+                </WrapPanel>
+                <TextBlock Name="RunStateText"
+                           DockPanel.Dock="Right"
+                           Foreground="#FFF9FAFB"
+                           FontWeight="SemiBold"
+                           VerticalAlignment="Center"
+                           Text="运行状态: --"/>
+            </DockPanel>
+        </Border>
+
+        <Border Grid.Row="3" Margin="0,12,0,0" Padding="10" CornerRadius="12" Background="#FF111827" BorderBrush="#FF374151" BorderThickness="1">
+            <TextBlock Text="提示: 控制命令优先通过 MQTT 发送；若 MQTT 未连接则自动走 LAN HTTP。" Foreground="#FF93C5FD"/>
+        </Border>
+
+        <Border Grid.Row="4" Margin="0,12,0,0" Padding="14" CornerRadius="12" Background="#FF111827" BorderBrush="#FF374151" BorderThickness="1">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <TextBlock Text="详细状态" Foreground="#FFE5E7EB" FontWeight="Bold" FontSize="16"/>
+                <TextBlock Grid.Row="1" Name="NetworkText" Margin="0,8,0,0" Foreground="#FF93C5FD" Text="网络: --"/>
+                <TextBlock Grid.Row="2" Name="FaultText" Margin="0,6,0,0" Foreground="#FFFCA5A5" Text="故障标志: --"/>
+                <TextBlock Grid.Row="3" Name="DataSourceText" Margin="0,6,0,0" Foreground="#FFFDE68A" Text="数据来源: --"/>
+                <TextBox Grid.Row="4"
+                         Name="RawJsonTextBox"
+                         Margin="0,10,0,0"
+                         FontFamily="Consolas"
+                         FontSize="13"
+                         IsReadOnly="True"
+                         TextWrapping="Wrap"
+                         VerticalScrollBarVisibility="Auto"
+                         HorizontalScrollBarVisibility="Auto"
+                         Background="#FF0B1220"
+                         Foreground="#FFE5E7EB"
+                         BorderBrush="#FF374151"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "CXZ/4e1kwoI=",
+  "success": true,
+  "projectFilePath": "D:\\competition\\3D-Printer-Filament-Dryer\\FilamentDryerMonitor\\FilamentDryerMonitor.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\zuoqirun\\.nuget\\packages\\mqttnet\\5.1.0.1559\\mqttnet.5.1.0.1559.nupkg.sha512"
+  ],
+  "logs": []
+}

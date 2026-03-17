@@ -1,6 +1,7 @@
 ﻿#include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
+#include <Adafruit_SHT31.h>
 #include <U8g2lib.h>
 #include <Preferences.h>
 #include <FS.h>
@@ -11,6 +12,7 @@
 #include <ArduinoJson.h>
 #include "dryer_common.h"
 #include "pid_autotune.h"
+#include "NebulaDeckMenu.h"
 
 /*
 接线图（ESP32-S3）：
@@ -33,7 +35,7 @@ I2C：
   12V+   -> Fan V+
   GND    -> Fan GND（与 ESP32 共地）
   GPIO5  -> Fan PWM 输入（建议按风扇规格使用开漏/电平转换）
-  Fan TACH -> 可选测速输入（当前代码未启用）
+  Fan TACH -> （当前固件未启用测速输入）
 
 五键按键（默认低电平按下，使用 INPUT_PULLUP）：
   上键 -> GPIO10
@@ -57,10 +59,13 @@ constexpr uint8_t BTN_OK_PIN = 14;     // 中键 GPIO（确认/进入菜单）�
 constexpr uint8_t FAN_PWM_CHANNEL = 0;          // ESP32 LEDC 通道号（风扇专用）。
 constexpr uint8_t FAN_PWM_RESOLUTION_BITS = 8;  // PWM 分辨率位数（0~255）。
 constexpr uint32_t FAN_PWM_FREQ_HZ = 25000;     // 四线风扇建议 PWM 频率（25kHz）。
+constexpr bool FAN_PWM_ACTIVE_LOW_DEFAULT = true;  // 四线风扇标准 PWM 为有效低电平，默认开启反相。
+constexpr float FAN_SIGNAL_HIGH_V = 3.3f;       // ESP32 GPIO PWM 高电平电压（V）。
+constexpr uint16_t FAN_EST_MAX_RPM = 7000;      // 100% PWM 对应的风扇满速估算值（可按实测修正）。
 
 constexpr uint32_t SENSOR_INTERVAL_MS = 500;       // 传感器采样周期（ms）。
 constexpr uint32_t CONTROL_INTERVAL_MS = 1000;     // PID/风扇控制周期（ms）。
-constexpr uint32_t DISPLAY_INTERVAL_MS = 200;      // OLED 刷新节拍（ms）。
+constexpr uint32_t DISPLAY_INTERVAL_MS = 80;       // OLED 刷新节拍（ms）。
 constexpr uint32_t PAGE_INTERVAL_MS = 3000;        // 主页温湿度自动轮播周期（ms）。
 constexpr uint32_t CONTROL_WINDOW_MS = 2000;       // 时间比例加热控制窗口（ms）。
 constexpr uint32_t STATE_SAVE_INTERVAL_MS = 10000; // NVS 自动保存周期（ms）。
@@ -90,6 +95,7 @@ constexpr uint8_t MAX_SENSOR_FAIL_COUNT = 5;  // 连续失败上限，超过即�
 
 constexpr float TARGET_TEMP_MIN_C = 35.0f;      // 菜单可设置的最低目标温度（摄氏度）。
 constexpr float TARGET_TEMP_MAX_C = 120.0f;     // 菜单可设置的最高目标温度（摄氏度）。
+constexpr float IDLE_TEMP_DISABLED_C = 0.0f;    // 闲时温度关闭值（0 表示不保温）。
 constexpr uint32_t DURATION_MIN_SEC = 30UL * 60UL;   // 最短烘干时长（秒）。
 constexpr uint32_t DURATION_MAX_SEC = 24UL * 3600UL; // 最长烘干时长（秒）。
 
@@ -120,6 +126,11 @@ constexpr MaterialPreset PRESETS[] = {
     {"PPS_CF", 100.0f, 10UL * 3600UL, 55, 100},
 };
 constexpr size_t PRESET_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
+constexpr uint8_t MAIN_MENU_COUNT = 10;
+constexpr const char* MAIN_MENU_ITEMS[MAIN_MENU_COUNT] = {
+    "启动/停止", "目标温度", "烘干时长", "闲时温度", "空闲风扇",
+    "自定义参数", "材料预设", "PID参数", "PID自校准", "清除故障",
+};
 
 enum PresetGroup : uint8_t {
   GROUP_BASIC = 0,      // 常规通用材料
@@ -144,11 +155,17 @@ enum FaultFlags : uint32_t {
   FAULT_OVER_TEMP = 1 << 1,
 };
 
+enum SensorType : uint8_t {
+  SENSOR_TYPE_AHT10 = 0,
+  SENSOR_TYPE_SHT3X = 1,
+};
+
 enum UiMode : uint8_t {
   UI_HOME = 0,
   UI_MENU,
   UI_SET_TEMP,
   UI_SET_TIME,
+  UI_SET_IDLE_TEMP,
   UI_SET_IDLE_FAN,
   UI_SET_PRESET,
   UI_SET_PID,
@@ -170,7 +187,23 @@ struct ButtonState {
   uint32_t lastChangeMs;
 };
 
+struct ValueSlideAnim {
+  char oldText[24];
+  char newText[24];
+  int8_t dir;
+  float progress;
+  bool active;
+};
+
+struct NumberRailAnim {
+  float oldValue;
+  float newValue;
+  float progress;
+  bool active;
+};
+
 Adafruit_AHTX0 aht10;
+Adafruit_SHT31 sht3x = Adafruit_SHT31();
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 Preferences prefs;
 WebServer g_webServer(80);
@@ -190,6 +223,7 @@ uint32_t g_faultFlags = FAULT_NONE;      // 当前故障位标志（可按位组
 
 bool g_sensorOk = false;                 // 温湿度传感器是否可用。
 uint8_t g_sensorFailCount = 0;           // 传感器连续读取失败计数。
+SensorType g_sensorType = SENSOR_TYPE_AHT10; // 当前温湿度传感器类型。
 float g_tempC = 0.0f;                    // 原始温度读数（摄氏度）。
 float g_humi = 0.0f;                     // 原始湿度读数（%RH）。
 float g_smoothTempC = 0.0f;              // 平滑后的温度（用于控制与显示）。
@@ -203,8 +237,12 @@ float g_heaterDemand = 0.0f;             // 加热需求比例（0.0~1.0）。
 bool g_heaterOn = false;                 // 当前加热输出通断状态。
 uint8_t g_fanPct = 0;                    // 当前风扇占空比百分比。
 uint8_t g_idleFanPct = 0;                // 空闲状态风扇转速（0~100%）。
+uint16_t g_fanRpm = 0;                       // 当前按 PWM 输出比例估算得到的转速（RPM）。
+bool g_fanPwmActiveLow = FAN_PWM_ACTIVE_LOW_DEFAULT; // PWM 极性：true=有效低电平（反相）。
+uint8_t g_fanPwmDutyRaw = 0;                  // 实际写入 LEDC 的原始 duty（0~255）。
 
 float g_targetTempC = 50.0f;             // 用户设定目标温度（摄氏度）。
+float g_idleTempC = IDLE_TEMP_DISABLED_C; // 闲时目标温度（0=关闭闲时保温）。
 uint32_t g_configDurationSec = 4UL * 3600UL;  // 用户设定烘干时长（秒）。
 float g_pidKp = PID_DEFAULT_KP;          // PID 比例参数 Kp。
 float g_pidKi = PID_DEFAULT_KI;          // PID 积分参数 Ki。
@@ -224,6 +262,13 @@ String g_wifiSsid;                       // 已保存的 Wi-Fi SSID。
 String g_wifiPass;                       // 已保存的 Wi-Fi 密码。
 bool g_wifiConnected = false;            // 当前是否已连接到路由器（STA）。
 bool g_apConfigMode = false;             // 当前是否处于 AP 配网模式。
+NebulaDeckMenu g_mainMenuFx;             // OLED 菜单动画渲染器。
+ValueSlideAnim g_animSetTemp = {"", "", 1, 1.0f, false};
+ValueSlideAnim g_animSetTime = {"", "", 1, 1.0f, false};
+ValueSlideAnim g_animIdleTemp = {"", "", 1, 1.0f, false};
+ValueSlideAnim g_animIdleFan = {"", "", 1, 1.0f, false};
+NumberRailAnim g_animSetTempRail = {50.0f, 50.0f, 1.0f, false};
+NumberRailAnim g_animIdleTempRail = {35.0f, 35.0f, 1.0f, false};
 
 // 主要功能：获取当前预设。
 // 使用方法：读取当前材料的风扇策略参数。
@@ -261,8 +306,28 @@ static void handleApiWifi();
 static void handleApiDevcmd();
 static void handleNotFound();
 static void serviceNetwork();
+static void setFanPct(uint8_t pct);
 static String executeConsoleCommand(const String& cmdLine);
 static void handleButtonEvents(bool up, bool down, bool left, bool right, bool ok);
+static const char* sensorTypeToString(SensorType type);
+static bool initTempHumiditySensor();
+static bool readTempHumidity(float& outTempC, float& outHumiPct);
+static bool idleHeatEnabled();
+static void drawHomeLayer(int16_t yOffset);
+static void updateSettingAnimations(uint32_t nowMs);
+static void startValueSlide(ValueSlideAnim& anim, const char* oldText, const char* newText, int8_t dir);
+static void drawFocusCard(int16_t baselineY, int16_t width, int16_t height, int16_t radius);
+static void drawCenteredText(const char* text, int16_t baselineY);
+static void drawValueWithSlide(const ValueSlideAnim& anim, const char* currentText, int16_t x, int16_t y,
+                               int16_t deltaY);
+static float easeOutCubic(float t);
+static void startNumberRailAnim(NumberRailAnim& anim, float oldValue, float newValue);
+static float sampleNumberRail(const NumberRailAnim& anim, float fallbackValue);
+static void drawTemperatureRail(const NumberRailAnim& anim, float currentValue, float minValue, float maxValue);
+static void formatSetTempText(float value, char* out, size_t outSize);
+static void formatSetTimeText(uint32_t sec, char* out, size_t outSize);
+static void formatIdleTempText(float value, char* out, size_t outSize);
+static void formatIdleFanText(uint8_t pct, char* out, size_t outSize);
 
 // 主要功能：根据预设索引查询其所属材料组。
 // 使用方法：用于预设菜单分组筛选与显示。
@@ -285,6 +350,10 @@ static size_t nextPresetInGroup(size_t current, int8_t delta, uint8_t group) {
   }
   return current;
 }
+
+// 主要功能：判断当前是否开启闲时保温功能。
+// 使用方法：仅在非烘干状态且闲时温度>=最低可控温度时返回 true。
+static bool idleHeatEnabled() { return (!g_dryingActive && g_idleTempC >= TARGET_TEMP_MIN_C); }
 
 // 主要功能：切换到某个分组并定位到该分组内最近可用预设。
 // 使用方法：在预设菜单切换组时调用。
@@ -316,6 +385,167 @@ static String formatDurationForWeb(uint32_t sec) {
   char buf[16];
   FormatDuration(sec, buf, sizeof(buf));
   return String(buf);
+}
+
+static void formatSetTempText(float value, char* out, size_t outSize) {
+  snprintf(out, outSize, "T=%.1fC", value);
+}
+
+static void formatSetTimeText(uint32_t sec, char* out, size_t outSize) {
+  FormatDuration(sec, out, outSize);
+}
+
+static void formatIdleTempText(float value, char* out, size_t outSize) {
+  if (value < TARGET_TEMP_MIN_C) {
+    snprintf(out, outSize, "OFF");
+  } else {
+    snprintf(out, outSize, "T=%.1fC", value);
+  }
+}
+
+static void formatIdleFanText(uint8_t pct, char* out, size_t outSize) {
+  snprintf(out, outSize, "FAN=%u%%", pct);
+}
+
+static float easeOutCubic(float t) {
+  if (t <= 0.0f) return 0.0f;
+  if (t >= 1.0f) return 1.0f;
+  float oneMinus = 1.0f - t;
+  return 1.0f - oneMinus * oneMinus * oneMinus;
+}
+
+static void startNumberRailAnim(NumberRailAnim& anim, float oldValue, float newValue) {
+  if (fabsf(oldValue - newValue) < 0.001f) return;
+  anim.oldValue = oldValue;
+  anim.newValue = newValue;
+  anim.progress = 0.0f;
+  anim.active = true;
+}
+
+static float sampleNumberRail(const NumberRailAnim& anim, float fallbackValue) {
+  if (!anim.active) return fallbackValue;
+  float eased = easeOutCubic(anim.progress);
+  return anim.oldValue + (anim.newValue - anim.oldValue) * eased;
+}
+
+static void startValueSlide(ValueSlideAnim& anim, const char* oldText, const char* newText, int8_t dir) {
+  if (strcmp(oldText, newText) == 0) return;
+  snprintf(anim.oldText, sizeof(anim.oldText), "%s", oldText);
+  snprintf(anim.newText, sizeof(anim.newText), "%s", newText);
+  anim.dir = (dir >= 0) ? 1 : -1;
+  anim.progress = 0.0f;
+  anim.active = true;
+}
+
+static void updateSettingAnimations(uint32_t nowMs) {
+  static uint32_t lastMs = 0;
+  if (lastMs == 0) {
+    lastMs = nowMs;
+    return;
+  }
+  float dtSec = static_cast<float>(nowMs - lastMs) / 1000.0f;
+  lastMs = nowMs;
+  if (dtSec < 0.001f) dtSec = 0.001f;
+  if (dtSec > 0.05f) dtSec = 0.05f;
+
+  ValueSlideAnim* anims[] = {&g_animSetTemp, &g_animSetTime, &g_animIdleTemp, &g_animIdleFan};
+  for (ValueSlideAnim* anim : anims) {
+    if (!anim->active) continue;
+    anim->progress += dtSec * 6.5f;
+    if (anim->progress >= 1.0f) {
+      anim->progress = 1.0f;
+      anim->active = false;
+    }
+  }
+
+  if (g_animSetTempRail.active) {
+    g_animSetTempRail.progress += dtSec * 4.8f;
+    if (g_animSetTempRail.progress >= 1.0f) {
+      g_animSetTempRail.progress = 1.0f;
+      g_animSetTempRail.active = false;
+    }
+  }
+
+  if (g_animIdleTempRail.active) {
+    g_animIdleTempRail.progress += dtSec * 4.8f;
+    if (g_animIdleTempRail.progress >= 1.0f) {
+      g_animIdleTempRail.progress = 1.0f;
+      g_animIdleTempRail.active = false;
+    }
+  }
+}
+
+static void drawFocusCard(int16_t baselineY, int16_t width, int16_t height, int16_t radius) {
+  const int16_t centerX = 64;
+  int16_t x = centerX - width / 2;
+  int16_t y = baselineY - height + 2;
+  oled.drawRBox(x, y, width, height, radius);
+}
+
+static void drawCenteredText(const char* text, int16_t baselineY) {
+  const int16_t centerX = 64;
+  int16_t width = oled.getStrWidth(text);
+  oled.drawStr(centerX - width / 2, baselineY, text);
+}
+
+static void drawValueWithSlide(const ValueSlideAnim& anim, const char* currentText, int16_t x, int16_t y,
+                               int16_t deltaY) {
+  (void)x;
+  const int16_t centerX = 64;
+  const int16_t focusW = 98;
+  const int16_t focusH = 32;
+  const int16_t focusX = centerX - focusW / 2;
+  const int16_t focusY = y - focusH + 2;
+  drawFocusCard(y, focusW, focusH, 6);
+
+  oled.setDrawColor(0);
+  oled.setClipWindow(focusX + 3, focusY + 2, focusX + focusW - 3, focusY + focusH - 2);
+  if (!anim.active) {
+    drawCenteredText(currentText, y);
+    oled.setMaxClipWindow();
+    oled.setDrawColor(1);
+    return;
+  }
+
+  int16_t oldY = y + ((anim.dir > 0) ? static_cast<int16_t>(-anim.progress * deltaY)
+                                      : static_cast<int16_t>(anim.progress * deltaY));
+  int16_t newY =
+      y + ((anim.dir > 0) ? static_cast<int16_t>((1.0f - anim.progress) * deltaY)
+                          : static_cast<int16_t>(-(1.0f - anim.progress) * deltaY));
+  int16_t top = y - deltaY - 2;
+  int16_t bottom = y + deltaY + 2;
+  if (top < 0) top = 0;
+  if (bottom > 63) bottom = 63;
+
+  int16_t clipTop = (focusY + 2 > top) ? (focusY + 2) : top;
+  int16_t clipBottom = (focusY + focusH - 2 < bottom + 1) ? (focusY + focusH - 2) : (bottom + 1);
+  oled.setClipWindow(focusX + 3, clipTop, focusX + focusW - 3, clipBottom);
+  drawCenteredText(anim.oldText, oldY);
+  drawCenteredText(anim.newText, newY);
+  oled.setMaxClipWindow();
+  oled.setDrawColor(1);
+}
+
+static void drawTemperatureRail(const NumberRailAnim& anim, float currentValue, float minValue, float maxValue) {
+  const int16_t centerX = 64;
+  const int16_t baselineY = 52;
+  float displayValue = ClampF(sampleNumberRail(anim, currentValue), minValue, maxValue);
+  const int16_t focusW = 82;
+  const int16_t focusH = 32;
+  drawFocusCard(baselineY, focusW, focusH, 6);
+
+  oled.setDrawColor(0);
+  oled.setFont(u8g2_font_logisoso24_tf);
+  char centerText[12];
+  snprintf(centerText, sizeof(centerText), "%.1f", displayValue);
+  int16_t centerWidth = oled.getStrWidth(centerText);
+  int16_t centerTextX = centerX - centerWidth / 2 - 3;
+  oled.drawStr(centerTextX, baselineY, centerText);
+
+  oled.setFont(u8g2_font_6x12_tf);
+  oled.drawStr(centerTextX + centerWidth + 4, baselineY - 1, "C");
+  oled.setDrawColor(1);
+  oled.setMaxClipWindow();
 }
 
 // 主要功能：在 OLED 上显示当前 Wi-Fi 阶段状态，避免联网阶段黑屏。
@@ -443,16 +673,17 @@ textarea{font-family:Consolas,"Courier New",monospace;resize:vertical}
       <div class="kv"><div class="k">目标/剩余</div><div class="v"><span id="target">--</span>C / <span id="remain">--</span></div></div>
       <div class="kv"><div class="k">运行/材料</div><div class="v"><span id="active">--</span> / <span id="preset">--</span></div></div>
     </div>
-    <div class="sub" style="margin-top:8px">加热 <span id="heater">--</span>% | 风扇转速(占空比) <span id="fan">--</span>% | <span id="fault" class="bad">无故障</span></div>
+    <div class="sub" style="margin-top:8px">加热 <span id="heater">--</span>% | 风扇转速(回传) <span id="fan">--</span> RPM | 风扇PWM信号 ~<span id="fanSigV">--</span>V/3.3V | <span id="fault" class="bad">无故障</span></div>
   </div>
   <div class="card span6 panel"><h2>温度曲线</h2><canvas id="cTemp" width="600" height="170"></canvas></div>
   <div class="card span6 panel"><h2>湿度曲线</h2><canvas id="cHumi" width="600" height="170"></canvas></div>
-  <div class="card span6 panel"><h2>风扇转速曲线(%)</h2><canvas id="cFan" width="600" height="170"></canvas></div>
+  <div class="card span6 panel"><h2>风扇转速曲线(RPM)</h2><canvas id="cFan" width="600" height="170"></canvas></div>
   <div class="card span6 panel"><h2>加热输出曲线(%)</h2><canvas id="cHeat" width="600" height="170"></canvas></div>
   <div class="card span4 panel"><h2>控制</h2>
     <label>参数模式</label><select id="modeSel" onchange="onModeChange()"><option value="custom">user</option><option value="preset">材料预设</option></select>
     <label>目标温度 (35~120 C)</label><input id="setTemp" type="number" step="0.5" min="35" max="120">
     <label>烘干时长 (分钟)</label><input id="setDur" type="number" min="30" max="1440">
+    <label>闲时温度 (0=关闭, 35~120 C)</label><input id="setIdleTemp" type="number" step="0.5" min="0" max="120">
     <label>空闲风扇转速 (0~100 %)</label><input id="setIdleFan" type="number" min="0" max="100">
     <div id="presetWrap"><label>材料预设</label><select id="presetSel" onchange="onPresetChange()"></select></div>
     <div class="row" style="margin-top:10px"><button onclick="sendCtrl('start')">启动</button><button onclick="sendCtrl('stop')">停止</button><button onclick="sendCtrl('faultreset')">清除故障</button><button onclick="applyCfg()">应用</button></div>
@@ -463,6 +694,9 @@ textarea{font-family:Consolas,"Courier New",monospace;resize:vertical}
     <label>Kd</label><input id="setKd" type="number" step="0.001" min="0" max="20">
     <div class="row" style="margin-top:10px"><button onclick="applyPid()">保存PID</button><button onclick="sendCtrl('pidreset')">恢复默认</button><button onclick="sendCtrl('autotune')">自动校准</button></div>
     <div class="sub" style="margin-top:8px">状态 <span id="tuneState">IDLE</span> | 进度 <span id="tuneProg">0</span>%</div>
+    <div class="sub" style="margin-top:4px">阶段 <span id="tuneStage">待机</span> | 拟合 <span id="tuneFit">未开始</span></div>
+    <div class="sub" style="margin-top:4px">样本 A/Tu: <span id="tuneAmpN">0</span>/<span id="tuneTuN">0</span> | A=<span id="tuneAmp">--</span>C | Tu=<span id="tuneTu">--</span>s</div>
+    <div class="sub" style="margin-top:4px">预估 Kp/Ki/Kd: <span id="tuneEst">--</span></div>
   </div>
   <div class="card span4 panel"><h2>Wi-Fi</h2>
     <label>SSID</label><input id="ssid" type="text" placeholder="路由器名称">
@@ -473,6 +707,22 @@ textarea{font-family:Consolas,"Courier New",monospace;resize:vertical}
   <div id="devPanel" class="card span12 panel" style="display:none">
     <h2>开发人员选项</h2>
     <div class="sub">可模拟串口命令并查看回显，支持 help/start/stop/status/faultreset 等。</div>
+    <label>温湿度传感器</label>
+    <div style="display:flex;gap:8px;align-items:center">
+      <select id="sensorType" style="flex:1">
+        <option value="aht10">AHT10</option>
+        <option value="sht3x">SHT3X</option>
+      </select>
+      <button style="width:180px;min-width:180px" onclick="applySensorType()">应用并重初始化</button>
+    </div>
+    <label>PWM极性</label>
+    <div style="display:flex;gap:8px;align-items:center">
+      <select id="fanPwmPol" style="flex:1">
+        <option value="active_low">有效低电平(推荐)</option>
+        <option value="active_high">有效高电平</option>
+      </select>
+      <button style="width:180px;min-width:180px" onclick="applyFanPwmPol()">应用极性</button>
+    </div>
     <label>虚拟按键</label>
     <div class="row">
       <button onclick="sendDevKey('up')">上</button>
@@ -498,6 +748,14 @@ let devTapCount=0,devLastTapMs=0,devPanelShown=false;
 async function jget(u){const r=await fetch(u);return await r.json();}
 async function jpost(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});return await r.json();}
 function setText(id,v){document.getElementById(id).textContent=v;}
+function mapTuneStage(s){
+  const m={IDLE:'待机',HEATUP:'升温激励',SEARCH_AMP:'振幅采样',WAIT_PERIOD:'周期等待',COLLECT:'样本积累',FIT:'拟合计算',DONE:'完成',FAIL:'失败'};
+  return m[s]||s||'--';
+}
+function mapTuneFit(s){
+  const m={N_A:'未开始',INSUFFICIENT:'样本不足',AMP_LOW:'振幅过小',PERIOD_SHORT:'周期偏短',PREVIEW:'可预估',READY:'可拟合',DONE:'拟合成功',FAIL:'拟合失败'};
+  return m[s]||s||'--';
+}
 function appendDevLog(msg){const box=document.getElementById('devLog');if(!box)return;box.value+=msg+'\n';box.scrollTop=box.scrollHeight;}
 function toggleDevPanel(forceShow){
   const panel=document.getElementById('devPanel');
@@ -559,7 +817,7 @@ function draw(canvasId,data,color,minV,maxV){
 function renderCharts(){
   const rT=calcRange(hs.t,{hardMin:null,hardMax:null,defMin:20,defMax:60,minSpan:3,pad:0.2});
   const rH=calcRange(hs.h,{hardMin:0,hardMax:100,defMin:20,defMax:80,minSpan:8,pad:0.15});
-  const rF=calcRange(hs.f,{hardMin:0,hardMax:100,defMin:0,defMax:100,minSpan:10,pad:0.1});
+  const rF=calcRange(hs.f,{hardMin:0,hardMax:null,defMin:0,defMax:3000,minSpan:300,pad:0.15});
   const rP=calcRange(hs.p,{hardMin:0,hardMax:100,defMin:0,defMax:100,minSpan:10,pad:0.1});
   draw('cTemp',hs.t,'#ef4444',rT.min,rT.max); draw('cHumi',hs.h,'#3b82f6',rH.min,rH.max);
   draw('cFan',hs.f,'#22c55e',rF.min,rF.max); draw('cHeat',hs.p,'#f59e0b',rP.min,rP.max);
@@ -568,14 +826,19 @@ async function refresh(){
   const s=await jget('/api/status');
   setText('temp',s.temp_c.toFixed(1)); setText('humi',s.humi_pct.toFixed(1)); setText('target',s.target_c.toFixed(1));
   setText('remain',s.remaining_hms); setText('preset',s.preset); setText('active',s.active?'运行中':'已停止');
-  setText('heater',s.heater_pct); setText('fan',s.fan_pct);
+  setText('heater',s.heater_pct); setText('fan',s.fan_rpm);
+  const fanV=(typeof s.fan_pwm_avg_v==='number')?s.fan_pwm_avg_v.toFixed(2):((s.fan_pct*3.3/100).toFixed(2));
+  setText('fanSigV',fanV);
   document.getElementById('fault').textContent=s.fault===0?'无故障':'故障码: '+s.fault;
   document.getElementById('net').innerHTML=(s.wifi_connected?'<span class="ok">已联网</span> ':'<span class="bad">未联网</span> ')+'IP: '+s.ip+(s.ap_mode?' | AP配网模式':'');
+  if(canFill('sensorType') && s.sensor_type){ document.getElementById('sensorType').value=s.sensor_type; }
+  if(canFill('fanPwmPol')){ document.getElementById('fanPwmPol').value=s.fan_pwm_active_low?'active_low':'active_high'; }
   const presetChanged=(s.preset_index!==lastPresetIndex);
   const allowParamFill=(!uiInited)||forceParamSync||(!s.user_custom_mode&&presetChanged);
   if(allowParamFill){
     if(canFill('setTemp')) document.getElementById('setTemp').value=s.target_c.toFixed(1);
     if(canFill('setDur')) document.getElementById('setDur').value=Math.round(s.config_duration_sec/60);
+    if(canFill('setIdleTemp')) document.getElementById('setIdleTemp').value=s.idle_temp_c.toFixed(1);
     if(canFill('setIdleFan')) document.getElementById('setIdleFan').value=s.idle_fan_pct;
     forceParamSync=false;
   }
@@ -588,11 +851,26 @@ async function refresh(){
   }
   if(canFill('presetSel')) document.getElementById('presetSel').value=s.preset_index;
   setText('tuneState',s.pid_autotune_msg); setText('tuneProg',s.pid_autotune_progress);
-  push(hs.t,s.temp_c); push(hs.h,s.humi_pct); push(hs.f,s.fan_pct); push(hs.p,s.heater_pct); renderCharts();
+  setText('tuneStage',mapTuneStage(s.pid_autotune_stage));
+  setText('tuneFit',mapTuneFit(s.pid_autotune_fit_state));
+  setText('tuneAmpN',s.pid_autotune_amp_count??0);
+  setText('tuneTuN',s.pid_autotune_period_count??0);
+  const tuneAmp=(typeof s.pid_autotune_amp_c==='number'&&s.pid_autotune_amp_c>0)?s.pid_autotune_amp_c.toFixed(3):'--';
+  const tuneTu=(typeof s.pid_autotune_tu_s==='number'&&s.pid_autotune_tu_s>0)?s.pid_autotune_tu_s.toFixed(2):'--';
+  setText('tuneAmp',tuneAmp);
+  setText('tuneTu',tuneTu);
+  let est='--';
+  if(typeof s.pid_autotune_est_kp==='number'&&s.pid_autotune_est_kp>0&&
+     typeof s.pid_autotune_est_ki==='number'&&s.pid_autotune_est_ki>0&&
+     typeof s.pid_autotune_est_kd==='number'&&s.pid_autotune_est_kd>=0){
+    est=s.pid_autotune_est_kp.toFixed(3)+' / '+s.pid_autotune_est_ki.toFixed(4)+' / '+s.pid_autotune_est_kd.toFixed(3);
+  }
+  setText('tuneEst',est);
+  push(hs.t,s.temp_c); push(hs.h,s.humi_pct); push(hs.f,s.fan_rpm); push(hs.p,s.heater_pct); renderCharts();
   lastPresetIndex=s.preset_index; uiInited=true;
 }
 async function loadPresets(){const p=await jget('/api/presets');const sel=document.getElementById('presetSel');sel.innerHTML='';p.presets.forEach(x=>{const o=document.createElement('option');o.value=x.index;o.textContent=x.name+' ('+x.temp_c+'C)';sel.appendChild(o);});sel.value=p.current_index;}
-async function applyCfg(){const mode=document.getElementById('modeSel').value;const payload={target_c:parseFloat(document.getElementById('setTemp').value),duration_min:parseInt(document.getElementById('setDur').value,10),idle_fan_pct:parseInt(document.getElementById('setIdleFan').value,10),use_custom:(mode==='custom')};if(mode==='preset'){payload.preset_index=parseInt(document.getElementById('presetSel').value,10);}await jpost('/api/control',payload);forceParamSync=true;await refresh();}
+async function applyCfg(){const mode=document.getElementById('modeSel').value;const payload={target_c:parseFloat(document.getElementById('setTemp').value),idle_temp_c:parseFloat(document.getElementById('setIdleTemp').value),duration_min:parseInt(document.getElementById('setDur').value,10),idle_fan_pct:parseInt(document.getElementById('setIdleFan').value,10),use_custom:(mode==='custom')};if(mode==='preset'){payload.preset_index=parseInt(document.getElementById('presetSel').value,10);}await jpost('/api/control',payload);forceParamSync=true;await refresh();}
 async function applyPid(){const payload={pid_kp:parseFloat(document.getElementById('setKp').value),pid_ki:parseFloat(document.getElementById('setKi').value),pid_kd:parseFloat(document.getElementById('setKd').value)};await jpost('/api/control',payload);forcePidSync=true;await refresh();}
 async function sendCtrl(cmd){await jpost('/api/control',{cmd});if(cmd==='pidreset'){forcePidSync=true;}await refresh();}
 async function saveWifi(){await jpost('/api/wifi',{ssid:document.getElementById('ssid').value,password:document.getElementById('pass').value});}
@@ -618,6 +896,27 @@ async function sendDevKey(k){
   appendDevLog('> btn '+k);
   await refresh();
 }
+async function applySensorType(){
+  const v=document.getElementById('sensorType').value;
+  try{
+    const r=await jpost('/api/control',{sensor_type:v});
+    appendDevLog('[系统] 传感器已切换: '+v.toUpperCase()+(r&&r.ok===false&&r.msg?(' | '+r.msg):''));
+  }catch(e){
+    appendDevLog('[错误] 传感器切换失败');
+  }
+  await refresh();
+}
+async function applyFanPwmPol(){
+  const pol=document.getElementById('fanPwmPol').value;
+  const activeLow=(pol==='active_low');
+  try{
+    await jpost('/api/control',{fan_pwm_active_low:activeLow});
+    appendDevLog('[系统] PWM极性已切换: '+(activeLow?'有效低电平':'有效高电平'));
+  }catch(e){
+    appendDevLog('[错误] PWM极性切换失败');
+  }
+  await refresh();
+}
 document.getElementById('titleMain').addEventListener('click',onTitleClick);
 document.getElementById('devCmd').addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();sendDevCmd();}});
 loadPresets().then(refresh);setInterval(refresh,1000);
@@ -632,6 +931,7 @@ static void handleApiStatus() {
   doc["temp_c"] = g_smoothTempC;
   doc["humi_pct"] = g_smoothHumi;
   doc["target_c"] = g_targetTempC;
+  doc["idle_temp_c"] = g_idleTempC;
   doc["config_duration_sec"] = g_configDurationSec;
   doc["remaining_sec"] = g_remainingSec;
   doc["remaining_hms"] = formatDurationForWeb(g_remainingSec);
@@ -641,23 +941,97 @@ static void handleApiStatus() {
   doc["active"] = g_dryingActive;
   doc["heater_pct"] = RatioToPct(g_heaterDemand);
   doc["fan_pct"] = g_fanPct;
+  doc["fan_rpm"] = g_fanRpm;
+  doc["fan_pwm_high_v"] = FAN_SIGNAL_HIGH_V;
+  doc["fan_pwm_avg_v"] = (static_cast<float>(g_fanPwmDutyRaw) * FAN_SIGNAL_HIGH_V) / 255.0f;
+  doc["fan_pwm_duty_raw"] = g_fanPwmDutyRaw;
+  doc["fan_pwm_active_low"] = g_fanPwmActiveLow;
   doc["idle_fan_pct"] = g_idleFanPct;
+  doc["sensor_type"] = sensorTypeToString(g_sensorType);
+  doc["sensor_ok"] = g_sensorOk;
   doc["pid_kp"] = g_pidKp;
   doc["pid_ki"] = g_pidKi;
   doc["pid_kd"] = g_pidKd;
   doc["pid_autotune_msg"] = g_pidAutoTuneMsg;
   uint8_t tuneProgress = 0;
+  const char* tuneStage = "IDLE";
+  const char* tuneFitState = "N_A";
+  uint8_t tuneAmpCount = g_pidAutoTuneState.ampCount;
+  uint8_t tunePeriodCount = g_pidAutoTuneState.periodCount;
+  float tuneAmpC = (tuneAmpCount > 0) ? (g_pidAutoTuneState.ampSum / tuneAmpCount) : 0.0f;
+  float tuneTuS = (tunePeriodCount > 0) ? (g_pidAutoTuneState.periodSum / tunePeriodCount) : 0.0f;
+  float estKp = 0.0f;
+  float estKi = 0.0f;
+  float estKd = 0.0f;
+  bool fitReady = false;
+  uint32_t elapsedMs = 0;
   if (g_pidAutoTuneActive && g_pidAutoTuneState.startMs > 0) {
-    uint32_t elapsed = millis() - g_pidAutoTuneState.startMs;
-    float pTime = AUTOTUNE_CFG.minTimeMs > 0 ? static_cast<float>(elapsed) / AUTOTUNE_CFG.minTimeMs : 0.0f;
+    elapsedMs = millis() - g_pidAutoTuneState.startMs;
+    float pTime = AUTOTUNE_CFG.minTimeMs > 0 ? static_cast<float>(elapsedMs) / AUTOTUNE_CFG.minTimeMs : 0.0f;
     float pAmp = static_cast<float>(g_pidAutoTuneState.ampCount) / 4.0f;
     float pPeriod = static_cast<float>(g_pidAutoTuneState.periodCount) / 3.0f;
     float p = min(1.0f, min(pTime, min(pAmp, pPeriod)));
     tuneProgress = static_cast<uint8_t>(p * 100.0f);
+
+    if (g_pidAutoTuneState.ampCount == 0 && g_pidAutoTuneState.periodCount == 0) {
+      tuneStage = "HEATUP";
+    } else if (g_pidAutoTuneState.ampCount < 2) {
+      tuneStage = "SEARCH_AMP";
+    } else if (g_pidAutoTuneState.periodCount < 1) {
+      tuneStage = "WAIT_PERIOD";
+    } else if (pAmp < 1.0f || pPeriod < 1.0f || pTime < 1.0f) {
+      tuneStage = "COLLECT";
+    } else {
+      tuneStage = "FIT";
+    }
+
+    if (tuneAmpCount < 2 || tunePeriodCount < 1) {
+      tuneFitState = "INSUFFICIENT";
+    } else if (tuneAmpC <= AUTOTUNE_CFG.minAmplitudeC) {
+      tuneFitState = "AMP_LOW";
+    } else if (tuneTuS < 2.0f) {
+      tuneFitState = "PERIOD_SHORT";
+    } else if (tuneAmpCount < 4 || tunePeriodCount < 3 || pTime < 1.0f) {
+      tuneFitState = "PREVIEW";
+      fitReady = true;
+    } else {
+      tuneFitState = "READY";
+      fitReady = true;
+    }
   } else if (String(g_pidAutoTuneMsg) == "DONE") {
     tuneProgress = 100;
+    tuneStage = "DONE";
+    tuneFitState = "DONE";
+    fitReady = true;
+    estKp = g_pidKp;
+    estKi = g_pidKi;
+    estKd = g_pidKd;
+  } else if (String(g_pidAutoTuneMsg) == "FAIL") {
+    tuneStage = "FAIL";
+    tuneFitState = "FAIL";
+  }
+
+  if (fitReady && tuneAmpC > AUTOTUNE_CFG.minAmplitudeC && tuneTuS > 0.0f) {
+    float ku = (4.0f * AUTOTUNE_CFG.relayAmplitude) / (PI * tuneAmpC);
+    float kpk = 0.6f * ku;
+    float kik = (1.2f * ku) / tuneTuS;
+    float kdk = 0.075f * ku * tuneTuS;
+    estKp = ClampF(kpk, 0.01f, 3.0f);
+    estKi = ClampF(kik, 0.0001f, 0.20f);
+    estKd = ClampF(kdk, 0.0f, 20.0f);
   }
   doc["pid_autotune_progress"] = tuneProgress;
+  doc["pid_autotune_stage"] = tuneStage;
+  doc["pid_autotune_fit_state"] = tuneFitState;
+  doc["pid_autotune_amp_count"] = tuneAmpCount;
+  doc["pid_autotune_period_count"] = tunePeriodCount;
+  doc["pid_autotune_amp_c"] = tuneAmpC;
+  doc["pid_autotune_tu_s"] = tuneTuS;
+  doc["pid_autotune_est_kp"] = estKp;
+  doc["pid_autotune_est_ki"] = estKi;
+  doc["pid_autotune_est_kd"] = estKd;
+  doc["pid_autotune_fit_ready"] = fitReady;
+  doc["pid_autotune_elapsed_ms"] = elapsedMs;
   doc["fault"] = g_faultFlags;
   doc["pid_autotune"] = g_pidAutoTuneActive;
   doc["wifi_connected"] = g_wifiConnected;
@@ -719,6 +1093,26 @@ static void handleApiControl() {
     }
   }
 
+  if (in["sensor_type"].is<const char*>()) {
+    String sensorType = in["sensor_type"].as<String>();
+    sensorType.toLowerCase();
+    if (sensorType == "aht10") {
+      g_sensorType = SENSOR_TYPE_AHT10;
+    } else if (sensorType == "sht3x" || sensorType == "sht31" || sensorType == "sht30") {
+      g_sensorType = SENSOR_TYPE_SHT3X;
+    } else {
+      g_webServer.send(400, "application/json", "{\"ok\":false,\"msg\":\"sensor_type无效\"}");
+      return;
+    }
+    initTempHumiditySensor();
+  }
+
+  if (in["fan_pwm_active_low"].is<bool>()) {
+    g_fanPwmActiveLow = in["fan_pwm_active_low"].as<bool>();
+    // 极性切换后按当前速度百分比立即重写 PWM 输出。
+    setFanPct(g_fanPct);
+  }
+
   bool hasTarget = (in["target_c"].is<float>() || in["target_c"].is<int>());
   bool hasDuration = in["duration_min"].is<int>();
   bool hasPreset = in["preset_index"].is<int>();
@@ -744,6 +1138,14 @@ static void handleApiControl() {
 
   if (in["target_c"].is<float>() || in["target_c"].is<int>()) {
     g_targetTempC = ClampF(in["target_c"].as<float>(), TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
+  }
+  if (in["idle_temp_c"].is<float>() || in["idle_temp_c"].is<int>()) {
+    float t = in["idle_temp_c"].as<float>();
+    if (t < TARGET_TEMP_MIN_C) {
+      g_idleTempC = IDLE_TEMP_DISABLED_C;
+    } else {
+      g_idleTempC = ClampF(t, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
+    }
   }
   if (in["duration_min"].is<int>()) {
     int durMin = in["duration_min"].as<int>();
@@ -908,7 +1310,12 @@ static void setHeater(bool on) {
 static void setFanPct(uint8_t pct) {
   g_fanPct = pct > 100 ? 100 : pct;
   uint8_t duty = static_cast<uint8_t>((static_cast<uint16_t>(g_fanPct) * 255U) / 100U);
-  ledcWrite(FAN_PWM_CHANNEL, duty);
+  if (g_fanPwmActiveLow) {
+    duty = static_cast<uint8_t>(255U - duty);
+  }
+  g_fanPwmDutyRaw = duty;
+  ledcWrite(FAN_PWM_CHANNEL, g_fanPwmDutyRaw);
+  g_fanRpm = static_cast<uint16_t>((static_cast<uint32_t>(g_fanPct) * FAN_EST_MAX_RPM) / 100U);
 }
 
 // 主要功能：把当前关键状态写入 NVS。
@@ -924,18 +1331,22 @@ static void saveState(bool force) {
   prefs.putUInt("preset", static_cast<uint32_t>(g_presetIndex));
   prefs.putUInt("fault", g_faultFlags);
   prefs.putFloat("target", g_targetTempC);
+  prefs.putFloat("idletmp", g_idleTempC);
   prefs.putUInt("cfgdur", g_configDurationSec);
   prefs.putFloat("kp", g_pidKp);
   prefs.putFloat("ki", g_pidKi);
   prefs.putFloat("kd", g_pidKd);
   prefs.putBool("usermode", g_userCustomMode);
   prefs.putUChar("idlefan", g_idleFanPct);
+  prefs.putBool("fanpwmlow", g_fanPwmActiveLow);
+  prefs.putUChar("sensortype", static_cast<uint8_t>(g_sensorType));
 }
 
 // 主要功能：从 NVS 读取状态并做断电恢复。
 // 使用方法：setup 中调用一次。
 static void loadState() {
   g_targetTempC = prefs.getFloat("target", PRESETS[0].targetTempC);
+  g_idleTempC = prefs.getFloat("idletmp", IDLE_TEMP_DISABLED_C);
   g_configDurationSec = prefs.getUInt("cfgdur", PRESETS[0].durationSec);
   g_pidKp = prefs.getFloat("kp", PID_DEFAULT_KP);
   g_pidKi = prefs.getFloat("ki", PID_DEFAULT_KI);
@@ -947,10 +1358,19 @@ static void loadState() {
   g_faultFlags = prefs.getUInt("fault", 0);
   g_userCustomMode = prefs.getBool("usermode", false);
   g_idleFanPct = prefs.getUChar("idlefan", 0);
+  g_fanPwmActiveLow = prefs.getBool("fanpwmlow", FAN_PWM_ACTIVE_LOW_DEFAULT);
+  uint8_t storedSensorType = prefs.getUChar("sensortype", static_cast<uint8_t>(SENSOR_TYPE_AHT10));
+  g_sensorType = (storedSensorType == static_cast<uint8_t>(SENSOR_TYPE_SHT3X)) ? SENSOR_TYPE_SHT3X
+                                                                                 : SENSOR_TYPE_AHT10;
   g_idleFanPct = constrain(g_idleFanPct, 0, 100);
 
   if (lastPreset < PRESET_COUNT) g_presetIndex = lastPreset;
   g_targetTempC = ClampF(g_targetTempC, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
+  if (g_idleTempC < TARGET_TEMP_MIN_C) {
+    g_idleTempC = IDLE_TEMP_DISABLED_C;
+  } else {
+    g_idleTempC = ClampF(g_idleTempC, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
+  }
   g_configDurationSec = constrain(g_configDurationSec, DURATION_MIN_SEC, DURATION_MAX_SEC);
 
   if (lastActive && lastRemain > 0) {
@@ -1004,6 +1424,67 @@ static void setFault(FaultFlags fault, const char* reason) {
 // 主要功能：清除故障标志。
 // 使用方法：确认安全后调用。
 static void clearFaults() { g_faultFlags = FAULT_NONE; }
+
+// 主要功能：返回当前温湿度传感器类型文本。
+// 使用方法：Web 状态回传、调试日志与配置保存时调用。
+static const char* sensorTypeToString(SensorType type) {
+  return (type == SENSOR_TYPE_SHT3X) ? "sht3x" : "aht10";
+}
+
+// 主要功能：按当前配置初始化温湿度传感器。
+// 使用方法：setup 启动阶段和网页切换传感器类型时调用。
+static bool initTempHumiditySensor() {
+  bool ok = false;
+  const char* reason = nullptr;
+  if (g_sensorType == SENSOR_TYPE_SHT3X) {
+    ok = sht3x.begin(0x44);
+    if (!ok) ok = sht3x.begin(0x45);
+    if (ok) {
+      sht3x.heater(false);
+      Serial.println("SHT3X 初始化成功。");
+    } else {
+      reason = "SHT3X 初始化失败";
+    }
+  } else {
+    ok = aht10.begin(&Wire);
+    if (ok) {
+      Serial.println("AHT10 初始化成功。");
+    } else {
+      reason = "AHT10 初始化失败";
+    }
+  }
+
+  g_sensorOk = ok;
+  if (ok) {
+    g_sensorFailCount = 0;
+    g_smoothInited = false;
+    g_faultFlags &= ~FAULT_SENSOR;
+  } else {
+    setFault(FAULT_SENSOR, reason ? reason : "传感器初始化失败");
+  }
+  return ok;
+}
+
+// 主要功能：读取一次温湿度采样值。
+// 使用方法：主循环采样阶段调用，按传感器类型分发底层读取。
+static bool readTempHumidity(float& outTempC, float& outHumiPct) {
+  if (g_sensorType == SENSOR_TYPE_SHT3X) {
+    float t = sht3x.readTemperature();
+    float h = sht3x.readHumidity();
+    if (isnan(t) || isnan(h)) return false;
+    outTempC = t;
+    outHumiPct = h;
+    return true;
+  }
+
+  sensors_event_t humEvent;
+  sensors_event_t tempEvent;
+  bool ok = aht10.getEvent(&humEvent, &tempEvent);
+  if (!ok) return false;
+  outTempC = tempEvent.temperature;
+  outHumiPct = humEvent.relative_humidity;
+  return true;
+}
 
 // 主要功能：应用预设（温度、时长、风扇策略索引）。
 // 使用方法：菜单/串口选择预设后调用。
@@ -1099,7 +1580,7 @@ static String executeConsoleCommand(const String& cmdLine) {
   lower.toLowerCase();
 
   if (lower == "help") {
-    return "命令：help | start | stop | preset <name> | status | faultreset | autotune | wifistatus | wifiap | wificlear | btn <up|down|left|right|ok>\n";
+    return "命令：help | start | stop | preset <name> | idletemp <0|35~120> | sensor <aht10|sht3x> | fanpwm <low|high> | status | faultreset | autotune | wifistatus | wifiap | wificlear | btn <up|down|left|right|ok>\n";
   }
   if (lower == "start") {
     startDrying();
@@ -1119,18 +1600,63 @@ static String executeConsoleCommand(const String& cmdLine) {
     }
     return "未知材料预设。\n";
   }
+  if (lower.startsWith("idletemp ")) {
+    String value = lower.substring(9);
+    value.trim();
+    float t = value.toFloat();
+    if (t < TARGET_TEMP_MIN_C) {
+      g_idleTempC = IDLE_TEMP_DISABLED_C;
+      saveState(true);
+      return "闲时温度已关闭。\n";
+    }
+    g_idleTempC = ClampF(t, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
+    saveState(true);
+    char line[64];
+    snprintf(line, sizeof(line), "闲时温度已设置为 %.1fC\n", g_idleTempC);
+    return String(line);
+  }
+  if (lower.startsWith("sensor ")) {
+    String sensor = lower.substring(7);
+    sensor.trim();
+    if (sensor == "aht10") {
+      g_sensorType = SENSOR_TYPE_AHT10;
+    } else if (sensor == "sht3x" || sensor == "sht31" || sensor == "sht30") {
+      g_sensorType = SENSOR_TYPE_SHT3X;
+    } else {
+      return "传感器类型无效，仅支持 aht10/sht3x。\n";
+    }
+    bool ok = initTempHumiditySensor();
+    saveState(true);
+    return ok ? String("传感器已切换：") + sensorTypeToString(g_sensorType) + "\n"
+              : String("传感器切换失败：") + sensorTypeToString(g_sensorType) + "\n";
+  }
+  if (lower.startsWith("fanpwm ")) {
+    String mode = lower.substring(7);
+    mode.trim();
+    if (mode == "low" || mode == "invert" || mode == "active_low") {
+      g_fanPwmActiveLow = true;
+    } else if (mode == "high" || mode == "normal" || mode == "active_high") {
+      g_fanPwmActiveLow = false;
+    } else {
+      return "fanpwm 参数无效，仅支持 low/high。\n";
+    }
+    setFanPct(g_fanPct);
+    saveState(true);
+    return String("风扇PWM极性已切换：") + (g_fanPwmActiveLow ? "有效低电平" : "有效高电平") + "\n";
+  }
   if (lower == "faultreset") {
     clearFaults();
     saveState(true);
     return "故障已清除。\n";
   }
   if (lower == "status") {
-    char line[196];
+    char line[288];
     snprintf(line, sizeof(line),
-             "预设:%s 运行:%u 温度:%.2fC 湿度:%.2f%% 目标:%.1fC 加热:%u%% 风扇:%u%% 故障:%lu 剩余:%lu\n",
+             "预设:%s 运行:%u 温度:%.2fC 湿度:%.2f%% 目标:%.1fC 闲时:%.1fC 加热:%u%% 风扇:%u%%/%uRPM PWM:%s 传感器:%s 故障:%lu 剩余:%lu\n",
              currentProfileName(), g_dryingActive ? 1 : 0, g_smoothTempC, g_smoothHumi, g_targetTempC,
-             RatioToPct(g_heaterDemand), g_fanPct, static_cast<unsigned long>(g_faultFlags),
-             static_cast<unsigned long>(g_remainingSec));
+             g_idleTempC, RatioToPct(g_heaterDemand), g_fanPct, g_fanRpm,
+             g_fanPwmActiveLow ? "active_low" : "active_high", sensorTypeToString(g_sensorType),
+             static_cast<unsigned long>(g_faultFlags), static_cast<unsigned long>(g_remainingSec));
     return String(line);
   }
   if (lower == "autotune") {
@@ -1207,6 +1733,8 @@ static void handleButtonEvents(bool up, bool down, bool left, bool right, bool o
     if (ok) {
       g_uiMode = UI_MENU;
       g_menuIndex = 0;
+      g_mainMenuFx.startEnter();
+      g_mainMenuFx.setSelection(g_menuIndex, true);
     }
     if (left || right) {
       g_showTempPage = !g_showTempPage;
@@ -1225,10 +1753,31 @@ static void handleButtonEvents(bool up, bool down, bool left, bool right, bool o
   }
 
   if (g_uiMode == UI_MENU) {
-    constexpr uint8_t menuCount = 9;
-    if (up && g_menuIndex > 0) g_menuIndex--;
-    if (down && g_menuIndex + 1 < menuCount) g_menuIndex++;
-    if (left) g_uiMode = UI_HOME;
+    if (g_mainMenuFx.isExiting()) return;
+
+    if (left) {
+      g_menuIndex = (g_menuIndex == 0) ? (MAIN_MENU_COUNT - 1) : (g_menuIndex - 1);
+      g_mainMenuFx.nudge(-1);
+      g_mainMenuFx.setSelection(g_menuIndex, false);
+    }
+    if (right) {
+      g_menuIndex = (g_menuIndex + 1) % MAIN_MENU_COUNT;
+      g_mainMenuFx.nudge(+1);
+      g_mainMenuFx.setSelection(g_menuIndex, false);
+    }
+    if (down) {
+      g_mainMenuFx.startExit();
+      return;
+    }
+    if (up) {
+      if (g_dryingActive) {
+        stopDrying();
+      } else {
+        startDrying();
+      }
+      g_mainMenuFx.startExit();
+      return;
+    }
     if (ok) {
       switch (g_menuIndex) {
         case 0:
@@ -1237,7 +1786,7 @@ static void handleButtonEvents(bool up, bool down, bool left, bool right, bool o
           } else {
             startDrying();
           }
-          g_uiMode = UI_HOME;
+          g_mainMenuFx.startExit();
           break;
         case 1:
           g_uiMode = UI_SET_TEMP;
@@ -1246,24 +1795,27 @@ static void handleButtonEvents(bool up, bool down, bool left, bool right, bool o
           g_uiMode = UI_SET_TIME;
           break;
         case 3:
-          g_uiMode = UI_SET_IDLE_FAN;
+          g_uiMode = UI_SET_IDLE_TEMP;
           break;
         case 4:
+          g_uiMode = UI_SET_IDLE_FAN;
+          break;
+        case 5:
           g_userCustomMode = true;
           g_uiMode = UI_SET_TEMP;
           break;
-        case 5:
+        case 6:
           g_uiMode = UI_SET_PRESET;
           break;
-        case 6:
+        case 7:
           g_uiMode = UI_SET_PID;
           g_pidEditIndex = 0;
           break;
-        case 7:
+        case 8:
           startPidAutoTune();
           g_uiMode = UI_HOME;
           break;
-        case 8:
+        case 9:
           clearFaults();
           saveState(true);
           g_uiMode = UI_HOME;
@@ -1274,6 +1826,7 @@ static void handleButtonEvents(bool up, bool down, bool left, bool right, bool o
   }
 
   if (g_uiMode == UI_SET_TEMP) {
+    float prevValue = g_targetTempC;
     bool changed = false;
     if (up) {
       g_targetTempC = ClampF(g_targetTempC + 0.5f, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
@@ -1291,13 +1844,17 @@ static void handleButtonEvents(bool up, bool down, bool left, bool right, bool o
       g_targetTempC = ClampF(g_targetTempC - 2.0f, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
       changed = true;
     }
-    if (changed) g_userCustomMode = true;
+    if (changed) {
+      g_userCustomMode = true;
+      startNumberRailAnim(g_animSetTempRail, prevValue, g_targetTempC);
+    }
     if (ok) g_uiMode = UI_MENU;
     saveState(true);
     return;
   }
 
   if (g_uiMode == UI_SET_TIME) {
+    uint32_t prevValue = g_configDurationSec;
     bool changed = false;
     if (up) {
       g_configDurationSec = SaturatingAddU32(g_configDurationSec, 10U * 60U, DURATION_MAX_SEC);
@@ -1315,17 +1872,78 @@ static void handleButtonEvents(bool up, bool down, bool left, bool right, bool o
       g_configDurationSec = SaturatingSubU32(g_configDurationSec, 60U * 60U, DURATION_MIN_SEC);
       changed = true;
     }
-    if (changed) g_userCustomMode = true;
+    if (changed) {
+      g_userCustomMode = true;
+      char oldText[24];
+      char newText[24];
+      formatSetTimeText(prevValue, oldText, sizeof(oldText));
+      formatSetTimeText(g_configDurationSec, newText, sizeof(newText));
+      int8_t dir = (g_configDurationSec >= prevValue) ? 1 : -1;
+      startValueSlide(g_animSetTime, oldText, newText, dir);
+    }
+    if (ok) g_uiMode = UI_MENU;
+    saveState(true);
+    return;
+  }
+
+  if (g_uiMode == UI_SET_IDLE_TEMP) {
+    float prevValue = g_idleTempC;
+    bool changed = false;
+    if (up) {
+      if (g_idleTempC < TARGET_TEMP_MIN_C) g_idleTempC = TARGET_TEMP_MIN_C;
+      g_idleTempC = ClampF(g_idleTempC + 0.5f, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
+      changed = true;
+    }
+    if (down) {
+      if (g_idleTempC <= TARGET_TEMP_MIN_C) {
+        g_idleTempC = IDLE_TEMP_DISABLED_C;
+      } else {
+        g_idleTempC = g_idleTempC - 0.5f;
+        if (g_idleTempC < TARGET_TEMP_MIN_C) g_idleTempC = IDLE_TEMP_DISABLED_C;
+      }
+      changed = true;
+    }
+    if (right) {
+      if (g_idleTempC < TARGET_TEMP_MIN_C) g_idleTempC = TARGET_TEMP_MIN_C;
+      g_idleTempC = ClampF(g_idleTempC + 2.0f, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
+      changed = true;
+    }
+    if (left) {
+      if (g_idleTempC <= TARGET_TEMP_MIN_C) {
+        g_idleTempC = IDLE_TEMP_DISABLED_C;
+      } else {
+        g_idleTempC = g_idleTempC - 2.0f;
+        if (g_idleTempC < TARGET_TEMP_MIN_C) g_idleTempC = IDLE_TEMP_DISABLED_C;
+      }
+      changed = true;
+    }
+    if (changed) {
+      if (g_idleTempC < TARGET_TEMP_MIN_C) {
+        g_animIdleTempRail.active = false;
+      } else {
+        float oldForAnim = (prevValue < TARGET_TEMP_MIN_C) ? TARGET_TEMP_MIN_C : prevValue;
+        startNumberRailAnim(g_animIdleTempRail, oldForAnim, g_idleTempC);
+      }
+    }
     if (ok) g_uiMode = UI_MENU;
     saveState(true);
     return;
   }
 
   if (g_uiMode == UI_SET_IDLE_FAN) {
+    uint8_t prevValue = g_idleFanPct;
     if (up) g_idleFanPct = constrain(static_cast<int>(g_idleFanPct) + 1, 0, 100);
     if (down) g_idleFanPct = constrain(static_cast<int>(g_idleFanPct) - 1, 0, 100);
     if (right) g_idleFanPct = constrain(static_cast<int>(g_idleFanPct) + 10, 0, 100);
     if (left) g_idleFanPct = constrain(static_cast<int>(g_idleFanPct) - 10, 0, 100);
+    if (g_idleFanPct != prevValue) {
+      char oldText[24];
+      char newText[24];
+      formatIdleFanText(prevValue, oldText, sizeof(oldText));
+      formatIdleFanText(g_idleFanPct, newText, sizeof(newText));
+      int8_t dir = (g_idleFanPct >= prevValue) ? 1 : -1;
+      startValueSlide(g_animIdleFan, oldText, newText, dir);
+    }
     if (ok) g_uiMode = UI_MENU;
     saveState(true);
     return;
@@ -1415,13 +2033,15 @@ static void updatePidControl() {
     return;
   }
 
-  if (!g_dryingActive || g_faultFlags != FAULT_NONE || !g_sensorOk) {
+  bool idleHeat = idleHeatEnabled();
+  if ((!g_dryingActive && !idleHeat) || g_faultFlags != FAULT_NONE || !g_sensorOk) {
     g_heaterDemand = 0.0f;
     return;
   }
 
   constexpr float DT = CONTROL_INTERVAL_MS / 1000.0f;
-  float error = g_targetTempC - g_smoothTempC;
+  float setpoint = g_dryingActive ? g_targetTempC : g_idleTempC;
+  float error = setpoint - g_smoothTempC;
 
   if (!g_pidInited) {
     g_pidPrevTemp = g_smoothTempC;
@@ -1473,7 +2093,8 @@ static void updateHeaterWindow() {
   if (now - windowStartMs >= CONTROL_WINDOW_MS) {
     windowStartMs = now;
   }
-  if (!g_dryingActive || g_faultFlags != FAULT_NONE || !g_sensorOk) {
+  bool idleHeat = idleHeatEnabled();
+  if ((!g_dryingActive && !idleHeat) || g_faultFlags != FAULT_NONE || !g_sensorOk) {
     setHeater(false);
     return;
   }
@@ -1484,117 +2105,134 @@ static void updateHeaterWindow() {
 
 // 主要功能：根据 UI 模式绘制 OLED。
 // 使用方法：当状态变化或到达刷新周期时调用。
+static void drawHomeLayer(int16_t yOffset) {
+  oled.setFont(u8g2_font_wqy12_t_gb2312);
+  oled.drawUTF8(0, 11 + yOffset, g_showTempPage ? "温度" : "湿度");
+  String ipTop = g_wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  oled.setFont(u8g2_font_4x6_tf);
+  oled.drawStr(68, 8 + yOffset, ipTop.c_str());
+  oled.drawHLine(0, 14 + yOffset, 128);
+
+  oled.setFont(u8g2_font_logisoso18_tf);
+  char mainText[24];
+  if (!g_sensorOk) {
+    snprintf(mainText, sizeof(mainText), "Err");
+  } else if (g_showTempPage) {
+    snprintf(mainText, sizeof(mainText), "%.1f C", g_smoothTempC);
+  } else {
+    snprintf(mainText, sizeof(mainText), "%.1f %%", g_smoothHumi);
+  }
+  oled.drawStr(0, 38 + yOffset, mainText);
+
+  char line2[48];
+  char remain[12];
+  FormatDuration(g_remainingSec, remain, sizeof(remain));
+  snprintf(line2, sizeof(line2), "P:%s T:%.1fC %s", currentProfileName(), g_targetTempC, remain);
+  if (g_userCustomMode) {
+    oled.setFont(u8g2_font_wqy12_t_gb2312);
+    oled.drawUTF8(0, 50 + yOffset, line2);
+    oled.setFont(u8g2_font_5x8_tf);
+  } else {
+    oled.setFont(u8g2_font_5x8_tf);
+    oled.drawStr(0, 50 + yOffset, line2);
+  }
+
+  char line3[48];
+  if (g_faultFlags != FAULT_NONE) {
+    snprintf(line3, sizeof(line3), "FAULT:%lu", static_cast<unsigned long>(g_faultFlags));
+  } else if (g_pidAutoTuneActive) {
+    snprintf(line3, sizeof(line3), "PID-TUNE %s", g_pidAutoTuneMsg);
+  } else if (!g_wifiConnected) {
+    if (g_apConfigMode) {
+      snprintf(line3, sizeof(line3), "WIFI:AP %s", WiFi.softAPIP().toString().c_str());
+    } else {
+      snprintf(line3, sizeof(line3), "WIFI:DISCONNECTED");
+    }
+  } else {
+    const char* mode = g_dryingActive ? "RUN" : (idleHeatEnabled() ? "IDLEHEAT" : "STOP");
+    snprintf(line3, sizeof(line3), "H:%u F:%u %s", RatioToPct(g_heaterDemand), g_fanPct, mode);
+  }
+  oled.drawStr(0, 61 + yOffset, line3);
+}
+
 static void drawScreen() {
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x12_tf);
 
   if (g_uiMode == UI_HOME) {
-    oled.setFont(u8g2_font_wqy12_t_gb2312);
-    oled.drawUTF8(0, 11, g_showTempPage ? "温度" : "湿度");
-    String ipTop = g_wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
-    oled.setFont(u8g2_font_4x6_tf);
-    oled.drawStr(68, 8, ipTop.c_str());
-    oled.drawHLine(0, 14, 128);
-
-    oled.setFont(u8g2_font_logisoso18_tf);
-    char mainText[24];
-    if (!g_sensorOk) {
-      snprintf(mainText, sizeof(mainText), "Err");
-    } else if (g_showTempPage) {
-      snprintf(mainText, sizeof(mainText), "%.1f C", g_smoothTempC);
-    } else {
-      snprintf(mainText, sizeof(mainText), "%.1f %%", g_smoothHumi);
-    }
-    oled.drawStr(0, 38, mainText);
-
-    char line2[48];
-    char remain[12];
-    FormatDuration(g_remainingSec, remain, sizeof(remain));
-    snprintf(line2, sizeof(line2), "P:%s T:%.1fC %s", currentProfileName(), g_targetTempC, remain);
-    if (g_userCustomMode) {
-      oled.setFont(u8g2_font_wqy12_t_gb2312);
-      oled.drawUTF8(0, 50, line2);
-      oled.setFont(u8g2_font_5x8_tf);
-    } else {
-      oled.setFont(u8g2_font_5x8_tf);
-      oled.drawStr(0, 50, line2);
-    }
-
-    char line3[48];
-    if (g_faultFlags != FAULT_NONE) {
-      snprintf(line3, sizeof(line3), "FAULT:%lu", static_cast<unsigned long>(g_faultFlags));
-    } else if (g_pidAutoTuneActive) {
-      snprintf(line3, sizeof(line3), "PID-TUNE %s", g_pidAutoTuneMsg);
-    } else if (!g_wifiConnected) {
-      if (g_apConfigMode) {
-        snprintf(line3, sizeof(line3), "WIFI:AP %s", WiFi.softAPIP().toString().c_str());
-      } else {
-        snprintf(line3, sizeof(line3), "WIFI:DISCONNECTED");
-      }
-    } else {
-      snprintf(line3, sizeof(line3), "H:%u F:%u %s", RatioToPct(g_heaterDemand), g_fanPct,
-               g_dryingActive ? "RUN" : "STOP");
-    }
-    oled.drawStr(0, 61, line3);
+    drawHomeLayer(0);
   } else if (g_uiMode == UI_MENU) {
-    const char* items[] = {"启动/停止", "目标温度", "烘干时长", "空闲风扇", "自定义参数", "材料预设", "PID参数", "PID自校准", "清除故障"};
-    oled.setFont(u8g2_font_wqy12_t_gb2312);
-    oled.drawUTF8(0, 12, "菜单");
-    uint8_t startIdx = (g_menuIndex > 2) ? static_cast<uint8_t>(g_menuIndex - 2) : 0;
-    if (startIdx > 5) startIdx = 5;  // 9项菜单显示窗口(4行)
-    for (uint8_t i = 0; i < 4; ++i) {
-      uint8_t idx = startIdx + i;
-      if (idx >= 9) break;
-      char row[28];
-      snprintf(row, sizeof(row), "%c %s", (idx == g_menuIndex ? '>' : ' '), items[idx]);
-      oled.drawUTF8(0, 24 + i * 10, row);
-    }
+    int16_t menuY = g_mainMenuFx.menuOffsetY();
+    drawHomeLayer(menuY - 64);
+    g_mainMenuFx.render(oled);
   } else if (g_uiMode == UI_SET_TEMP) {
     oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "设定目标温度");
-    char t[24];
-    snprintf(t, sizeof(t), "T=%.1fC", g_targetTempC);
-    oled.setFont(u8g2_font_logisoso24_tf);
-    oled.drawStr(0, 52, t);
+    drawTemperatureRail(g_animSetTempRail, g_targetTempC, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
   } else if (g_uiMode == UI_SET_TIME) {
     oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "设定烘干时长");
     char d[16];
-    FormatDuration(g_configDurationSec, d, sizeof(d));
+    formatSetTimeText(g_configDurationSec, d, sizeof(d));
     oled.setFont(u8g2_font_logisoso18_tf);
-    oled.drawStr(0, 52, d);
+    drawValueWithSlide(g_animSetTime, d, 0, 52, 12);
+  } else if (g_uiMode == UI_SET_IDLE_TEMP) {
+    oled.setFont(u8g2_font_wqy12_t_gb2312);
+    oled.drawUTF8(0, 12, "设定闲时温度");
+    if (g_idleTempC < TARGET_TEMP_MIN_C) {
+      const int16_t baselineY = 52;
+      drawFocusCard(baselineY, 82, 32, 6);
+      oled.setDrawColor(0);
+      oled.setFont(u8g2_font_logisoso24_tf);
+      drawCenteredText("OFF", baselineY);
+      oled.setDrawColor(1);
+    } else {
+      drawTemperatureRail(g_animIdleTempRail, g_idleTempC, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C);
+    }
   } else if (g_uiMode == UI_SET_IDLE_FAN) {
     oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "设定空闲风扇");
     char f[24];
-    snprintf(f, sizeof(f), "FAN=%u%%", g_idleFanPct);
+    formatIdleFanText(g_idleFanPct, f, sizeof(f));
     oled.setFont(u8g2_font_logisoso18_tf);
-    oled.drawStr(0, 52, f);
+    drawValueWithSlide(g_animIdleFan, f, 0, 52, 12);
   } else if (g_uiMode == UI_SET_PRESET) {
     oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "选择材料预设");
-    oled.setFont(u8g2_font_wqy12_t_gb2312);
     char gline[24];
     snprintf(gline, sizeof(gline), "组:%s", PRESET_GROUP_NAMES[g_presetGroupFilter]);
-    oled.drawUTF8(0, 24, gline);
+    int16_t glineW = oled.getUTF8Width(gline);
+    oled.drawUTF8((128 - glineW) / 2, 24, gline);
+    drawFocusCard(50, 102, 32, 6);
+    oled.setDrawColor(0);
     oled.setFont(u8g2_font_logisoso18_tf);
-    oled.drawStr(0, 46, activePreset().name);
+    drawCenteredText(activePreset().name, 50);
+    oled.setDrawColor(1);
     char p[20];
     snprintf(p, sizeof(p), "T%.1fC", g_targetTempC);
     oled.setFont(u8g2_font_6x12_tf);
-    oled.drawStr(0, 56, p);
+    drawCenteredText(p, 62);
   } else if (g_uiMode == UI_SET_PID) {
+    const char* pidName[3] = {"Kp", "Ki", "Kd"};
+    float pidVal[3] = {g_pidKp, g_pidKi, g_pidKd};
     oled.setFont(u8g2_font_wqy12_t_gb2312);
     oled.drawUTF8(0, 12, "PID参数");
-    char l1[24];
-    char l2[24];
-    char l3[24];
-    snprintf(l1, sizeof(l1), "%cKp=%.3f", g_pidEditIndex == 0 ? '>' : ' ', g_pidKp);
-    snprintf(l2, sizeof(l2), "%cKi=%.3f", g_pidEditIndex == 1 ? '>' : ' ', g_pidKi);
-    snprintf(l3, sizeof(l3), "%cKd=%.3f", g_pidEditIndex == 2 ? '>' : ' ', g_pidKd);
-    oled.drawStr(0, 28, l1);
-    oled.drawStr(0, 40, l2);
-    oled.drawStr(0, 52, l3);
+    char tag[16];
+    snprintf(tag, sizeof(tag), "当前:%s", pidName[g_pidEditIndex]);
+    int16_t tagW = oled.getUTF8Width(tag);
+    oled.drawUTF8((128 - tagW) / 2, 24, tag);
+    drawFocusCard(50, 102, 32, 6);
+    oled.setDrawColor(0);
+    oled.setFont(u8g2_font_logisoso18_tf);
+    char v[24];
+    snprintf(v, sizeof(v), "%s=%.3f", pidName[g_pidEditIndex], pidVal[g_pidEditIndex]);
+    drawCenteredText(v, 50);
+    oled.setDrawColor(1);
+    oled.setFont(u8g2_font_5x8_tf);
+    char nav[28];
+    snprintf(nav, sizeof(nav), "%s %s %s", g_pidEditIndex == 0 ? "[Kp]" : " Kp ",
+             g_pidEditIndex == 1 ? "[Ki]" : " Ki ", g_pidEditIndex == 2 ? "[Kd]" : " Kd ");
+    drawCenteredText(nav, 62);
   }
 
   oled.sendBuffer();
@@ -1627,15 +2265,21 @@ void setup() {
 
   prefs.begin("dryer", false);
   loadState();
+  g_animSetTempRail.oldValue = g_targetTempC;
+  g_animSetTempRail.newValue = g_targetTempC;
+  g_animSetTempRail.progress = 1.0f;
+  g_animSetTempRail.active = false;
+  float idleInitTemp = (g_idleTempC < TARGET_TEMP_MIN_C) ? TARGET_TEMP_MIN_C : g_idleTempC;
+  g_animIdleTempRail.oldValue = idleInitTemp;
+  g_animIdleTempRail.newValue = idleInitTemp;
+  g_animIdleTempRail.progress = 1.0f;
+  g_animIdleTempRail.active = false;
   loadWifiConfig();
   setFanPct(g_idleFanPct);
+  g_mainMenuFx.begin(MAIN_MENU_ITEMS, MAIN_MENU_COUNT);
+  g_mainMenuFx.setSelection(g_menuIndex, true);
 
-  g_sensorOk = aht10.begin(&Wire);
-  if (!g_sensorOk) {
-    setFault(FAULT_SENSOR, "AHT10 初始化失败");
-  } else {
-    Serial.println("AHT10 初始化成功。");
-  }
+  initTempHumiditySensor();
 
   if (!connectWifiSta()) {
     startConfigApPortal();
@@ -1663,13 +2307,22 @@ void loop() {
   serviceNetwork();
   processSerialCommands();
   processButtonUi();
+  updateSettingAnimations(now);
+  if (g_uiMode == UI_MENU) {
+    g_mainMenuFx.setSelection(g_menuIndex, false);
+    if (g_mainMenuFx.tick(now)) needRedraw = true;
+    if (g_mainMenuFx.isExitFinished()) {
+      g_uiMode = UI_HOME;
+      needRedraw = true;
+    }
+  }
 
   // B. 采样层：读取温湿度，做滤波与故障检测。
   if (now - lastSensorMs >= SENSOR_INTERVAL_MS) {
     lastSensorMs = now;
-    sensors_event_t humEvent;
-    sensors_event_t tempEvent;
-    bool ok = aht10.getEvent(&humEvent, &tempEvent);
+    float sampleTempC = 0.0f;
+    float sampleHumiPct = 0.0f;
+    bool ok = readTempHumidity(sampleTempC, sampleHumiPct);
     if (!ok) {
       if (g_sensorFailCount < 255) g_sensorFailCount++;
       if (g_sensorFailCount >= MAX_SENSOR_FAIL_COUNT) {
@@ -1679,8 +2332,8 @@ void loop() {
     } else {
       g_sensorOk = true;
       g_sensorFailCount = 0;
-      g_tempC = tempEvent.temperature;
-      g_humi = humEvent.relative_humidity;
+      g_tempC = sampleTempC;
+      g_humi = sampleHumiPct;
       if (!g_smoothInited) {
         g_smoothTempC = g_tempC;
         g_smoothHumi = g_humi;
@@ -1724,9 +2377,9 @@ void loop() {
   if (now - lastLogMs >= LOG_INTERVAL_MS) {
     lastLogMs = now;
     appendLogLine();
-    Serial.printf("温度:%.2fC 湿度:%.2f%% 目标:%.1fC 预设:%s 剩余:%lus 加热:%u%% 风扇:%u%% 故障:%lu\n",
+    Serial.printf("温度:%.2fC 湿度:%.2f%% 目标:%.1fC 预设:%s 剩余:%lus 加热:%u%% 风扇:%u%%/%uRPM 故障:%lu\n",
                   g_smoothTempC, g_smoothHumi, g_targetTempC, currentProfileName(),
-                  static_cast<unsigned long>(g_remainingSec), RatioToPct(g_heaterDemand), g_fanPct,
+                  static_cast<unsigned long>(g_remainingSec), RatioToPct(g_heaterDemand), g_fanPct, g_fanRpm,
                   static_cast<unsigned long>(g_faultFlags));
   }
 

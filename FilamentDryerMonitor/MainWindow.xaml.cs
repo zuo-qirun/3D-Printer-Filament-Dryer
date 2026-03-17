@@ -223,13 +223,36 @@ public partial class MainWindow : Window
 
     private async void AutoTuneButton_Click(object sender, RoutedEventArgs e) => await SendControlCommandAsync("autotune");
 
+    private async void ApplyIdleTempButton_Click(object sender, RoutedEventArgs e)
+    {
+        string raw = IdleTempSetTextBox.Text.Trim();
+        if (!double.TryParse(raw, out double idleTemp))
+        {
+            MessageBox.Show("闲时温度请输入数字（0 或 35~120）。", "输入错误", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (!(idleTemp == 0 || (idleTemp >= 35 && idleTemp <= 120)))
+        {
+            MessageBox.Show("闲时温度范围应为 0（关闭）或 35~120。", "输入错误", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        await SendControlPayloadAsync(new { idle_temp_c = idleTemp }, $"闲时温度已发送: {idleTemp:F1}C");
+    }
+
     private async Task SendControlCommandAsync(string command)
+    {
+        await SendControlPayloadAsync(new { cmd = command }, $"控制命令已发送: {command}");
+    }
+
+    private async Task SendControlPayloadAsync(object payload, string sourceHint)
     {
         try
         {
             if (_mqttClient is not null && _mqttClient.IsConnected)
             {
-                string message = JsonSerializer.Serialize(new { cmd = command });
+                string message = JsonSerializer.Serialize(payload);
                 var mqttMessage = new MqttApplicationMessageBuilder()
                     .WithTopic(_controlTopic)
                     .WithPayload(message)
@@ -237,7 +260,7 @@ public partial class MainWindow : Window
                     .Build();
 
                 await _mqttClient.PublishAsync(mqttMessage);
-                DataSourceText.Text = $"数据来源: 控制命令已发布到 MQTT {_controlTopic}";
+                DataSourceText.Text = $"数据来源: {sourceHint} (MQTT {_controlTopic})";
                 return;
             }
 
@@ -247,7 +270,6 @@ public partial class MainWindow : Window
                 return;
             }
 
-            var payload = new { cmd = command };
             using HttpResponseMessage resp = await _httpClient.PostAsJsonAsync($"{_baseUrl}/api/control", payload);
             resp.EnsureSuccessStatusCode();
             await PollStatusAsync();
@@ -300,10 +322,12 @@ public partial class MainWindow : Window
         TempText.Text = $"{status.temp_c:F1} C";
         HumiText.Text = $"{status.humi_pct:F1} %";
         TargetText.Text = $"{status.target_c:F1} C";
+        IdleTempText.Text = status.idle_temp_c < 35 ? "OFF" : $"{status.idle_temp_c:F1} C";
+        IdleTempSetTextBox.Text = status.idle_temp_c < 35 ? "0" : status.idle_temp_c.ToString("F1");
         RemainingText.Text = status.remaining_hms;
 
         string runState = status.active ? "运行中" : "已停止";
-        RunStateText.Text = $"运行状态: {runState} | 预设: {status.preset} | 加热: {status.heater_pct}% | 风扇: {status.fan_pct}%";
+        RunStateText.Text = $"运行状态: {runState} | 预设: {status.preset} | 加热: {status.heater_pct}% | 风扇PWM: {status.fan_pct}% | 风扇转速: {status.fan_rpm} RPM";
 
         string wifiState = status.wifi_connected ? "已连接路由器" : (status.ap_mode ? "AP 配网模式" : "离线");
         NetworkText.Text = $"网络: {wifiState} | IP: {status.ip}";
@@ -377,5 +401,7 @@ public partial class MainWindow : Window
         int pid_autotune_progress,
         bool wifi_connected,
         bool ap_mode,
-        string ip);
+        string ip,
+        double idle_temp_c = 0,
+        int fan_rpm = 0);
 }

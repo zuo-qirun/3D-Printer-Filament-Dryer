@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("FilamentDryerMonitor")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a34d5653393d9a0e481dc3a66fc8434fbde32070")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+8b1d34ffb44830a7c9037a3167338db7a421d9f1")]
 [assembly: System.Reflection.AssemblyProductAttribute("FilamentDryerMonitor")]
 [assembly: System.Reflection.AssemblyTitleAttribute("FilamentDryerMonitor")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

@@ -89,7 +89,7 @@
         </Border>
 
         <Border Grid.Row="1" Margin="0,12,0,0" Padding="14" CornerRadius="12" Background="#FF111827" BorderBrush="#FF374151" BorderThickness="1">
-            <UniformGrid Columns="4">
+            <UniformGrid Columns="5">
                 <StackPanel Margin="0,0,8,0">
                     <TextBlock Text="当前温度" Foreground="#FF9CA3AF"/>
                     <TextBlock Name="TempText" Text="--.- C" Foreground="#FF93C5FD" FontSize="28" FontWeight="Bold"/>
@@ -101,6 +101,10 @@
                 <StackPanel Margin="0,0,8,0">
                     <TextBlock Text="目标温度" Foreground="#FF9CA3AF"/>
                     <TextBlock Name="TargetText" Text="--.- C" Foreground="#FFFDE68A" FontSize="28" FontWeight="Bold"/>
+                </StackPanel>
+                <StackPanel Margin="0,0,8,0">
+                    <TextBlock Text="闲时温度" Foreground="#FF9CA3AF"/>
+                    <TextBlock Name="IdleTempText" Text="OFF" Foreground="#FFC4B5FD" FontSize="28" FontWeight="Bold"/>
                 </StackPanel>
                 <StackPanel>
                     <TextBlock Text="剩余时间" Foreground="#FF9CA3AF"/>
@@ -117,6 +121,18 @@
                     <Button Content="清除故障" Padding="14,8" Margin="0,0,8,0" Click="FaultResetButton_Click"/>
                     <Button Content="PID 自整定" Padding="14,8" Click="AutoTuneButton_Click"/>
                 </WrapPanel>
+                <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" Margin="16,0,0,0" VerticalAlignment="Center">
+                    <TextBlock Text="闲时温度" Foreground="#FFE5E7EB" VerticalAlignment="Center"/>
+                    <TextBox Name="IdleTempSetTextBox"
+                             Width="90"
+                             Margin="8,0,0,0"
+                             Text="0"
+                             Background="#FF1F2937"
+                             Foreground="#FFF9FAFB"
+                             BorderBrush="#FF4B5563"
+                             VerticalContentAlignment="Center"/>
+                    <Button Content="应用闲时温度" Padding="12,8" Margin="8,0,0,0" Click="ApplyIdleTempButton_Click"/>
+                </StackPanel>
                 <TextBlock Name="RunStateText"
                            DockPanel.Dock="Right"
                            Foreground="#FFF9FAFB"

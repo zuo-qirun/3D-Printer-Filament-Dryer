@@ -1977,6 +1977,7 @@ static void updateDryingCompletionByHumidity() {
 }
 
 static void updateAdvancedFaults(uint32_t nowMs) {
+  if (nowMs < g_dryingStartMs) return;
   if (!g_dryingActive || !g_sensorOk || g_pidAutoTuneActive) {
     g_lastReachedSetpointMs = 0;
     g_heaterDemandZeroSinceMs = 0;

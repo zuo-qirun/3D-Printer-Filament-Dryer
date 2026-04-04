@@ -9,7 +9,10 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="MQTTnet" Version="5.1.0.1559" />
+    <Reference Include="MQTTnet">
+      <HintPath>bin\Debug\net10.0-windows\MQTTnet.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>

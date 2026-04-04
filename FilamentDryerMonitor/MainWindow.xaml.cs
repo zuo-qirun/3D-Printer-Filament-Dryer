@@ -8,6 +8,7 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
 using MQTTnet;
+using MQTTnet.Formatter;
 using MQTTnet.Protocol;
 
 namespace FilamentDryerMonitor;
@@ -22,8 +23,8 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _pollTimer;
     private string _baseUrl = string.Empty;
     private IMqttClient? _mqttClient;
-    private string _statusTopic = "dryer/esp32/status";
-    private string _controlTopic = "dryer/esp32/control";
+    private string _statusTopic = "dryer004";
+    private string _controlTopic = "dryer010/set";
 
     public MainWindow()
     {
@@ -34,10 +35,18 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromSeconds(1),
         };
         _pollTimer.Tick += async (_, _) => await PollStatusAsync();
+        UpdateLanButtonState(false);
+        UpdateMqttButtonState(false);
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_pollTimer.IsEnabled)
+        {
+            DisconnectLan();
+            return;
+        }
+
         string raw = AddressTextBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(raw))
         {
@@ -61,39 +70,49 @@ public partial class MainWindow : Window
         }
 
         _pollTimer.Start();
-        ConnectButton.IsEnabled = false;
-        DisconnectButton.IsEnabled = true;
         AddressTextBox.IsEnabled = false;
+        WebTokenTextBox.IsEnabled = false;
         SetConnectedVisuals(true, "LAN: 已连接");
     }
 
-    private void DisconnectButton_Click(object sender, RoutedEventArgs e)
+    private void DisconnectLan()
     {
         _pollTimer.Stop();
         _baseUrl = string.Empty;
-        ConnectButton.IsEnabled = true;
-        DisconnectButton.IsEnabled = false;
         AddressTextBox.IsEnabled = true;
+        WebTokenTextBox.IsEnabled = true;
         SetConnectedVisuals(false, "LAN: 未连接");
     }
 
     private async void MqttConnectButton_Click(object sender, RoutedEventArgs e)
     {
-        string host = MqttHostTextBox.Text.Trim();
-        string portText = MqttPortTextBox.Text.Trim();
-        string key = MqttKeyTextBox.Text.Trim();
-        _statusTopic = MqttStatusTopicTextBox.Text.Trim();
-        _controlTopic = MqttControlTopicTextBox.Text.Trim();
-
-        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(portText) || string.IsNullOrWhiteSpace(key))
+        if (_mqttClient is not null && _mqttClient.IsConnected)
         {
-            MessageBox.Show("MQTT 主机、端口和私钥不能为空。", "MQTT 参数错误", MessageBoxButton.OK, MessageBoxImage.Warning);
+            await DisconnectMqttAsync();
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(_statusTopic) || string.IsNullOrWhiteSpace(_controlTopic))
+        string host = MqttHostTextBox.Text.Trim();
+        string portText = MqttPortTextBox.Text.Trim();
+        string key = MqttKeyTextBox.Text.Trim();
+        string statusBase = NormalizeBemfaTopicBase(MqttStatusTopicTextBox.Text.Trim());
+        string controlBase = NormalizeBemfaTopicBase(MqttControlTopicTextBox.Text.Trim());
+
+        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(portText) || string.IsNullOrWhiteSpace(key))
         {
-            MessageBox.Show("MQTT 主题不能为空。", "MQTT 参数错误", MessageBoxButton.OK, MessageBoxImage.Warning);
+            MessageBox.Show("MQTT 主机、端口和 Bemfa 私钥(ClientId)不能为空。", "MQTT 参数错误", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(statusBase) || string.IsNullOrWhiteSpace(controlBase))
+        {
+            MessageBox.Show("MQTT 主题基名不能为空。", "MQTT 参数错误", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (!IsBemfaTopicBase(statusBase) || !IsBemfaTopicBase(controlBase))
+        {
+            MessageBox.Show("Bemfa 主题基名只能包含字母和数字。", "MQTT 参数错误", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
@@ -105,6 +124,11 @@ public partial class MainWindow : Window
 
         try
         {
+            MqttStatusTopicTextBox.Text = statusBase;
+            MqttControlTopicTextBox.Text = controlBase;
+            _statusTopic = BuildStatusTopic(statusBase);
+            _controlTopic = BuildControlTopic(controlBase);
+
             _mqttClient ??= new MqttClientFactory().CreateMqttClient();
             _mqttClient.ApplicationMessageReceivedAsync -= OnMqttMessageReceivedAsync;
             _mqttClient.ConnectedAsync -= OnMqttConnectedAsync;
@@ -114,17 +138,15 @@ public partial class MainWindow : Window
             _mqttClient.DisconnectedAsync += OnMqttDisconnectedAsync;
 
             var options = new MqttClientOptionsBuilder()
-                .WithClientId($"dryer-desktop-{Guid.NewGuid():N}")
+                .WithClientId(key)
                 .WithTcpServer(host, port)
-                .WithCredentials(key, string.Empty)
+                .WithProtocolVersion(MqttProtocolVersion.V311)
                 .WithCleanSession()
                 .Build();
 
             SetMqttVisuals(false, "MQTT: 连接中...");
             await _mqttClient.ConnectAsync(options);
 
-            MqttConnectButton.IsEnabled = false;
-            MqttDisconnectButton.IsEnabled = true;
             SetMqttVisuals(true, $"MQTT: 已连接 ({host}:{port})");
         }
         catch (Exception ex)
@@ -134,7 +156,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void MqttDisconnectButton_Click(object sender, RoutedEventArgs e)
+    private async Task DisconnectMqttAsync()
     {
         if (_mqttClient is not null && _mqttClient.IsConnected)
         {
@@ -148,8 +170,6 @@ public partial class MainWindow : Window
             }
         }
 
-        MqttConnectButton.IsEnabled = true;
-        MqttDisconnectButton.IsEnabled = false;
         SetMqttVisuals(false, "MQTT: 未连接");
     }
 
@@ -177,8 +197,6 @@ public partial class MainWindow : Window
     {
         _ = Dispatcher.InvokeAsync(() =>
         {
-            MqttConnectButton.IsEnabled = true;
-            MqttDisconnectButton.IsEnabled = false;
             SetMqttVisuals(false, "MQTT: 已断开");
         });
 
@@ -270,7 +288,8 @@ public partial class MainWindow : Window
                 return;
             }
 
-            using HttpResponseMessage resp = await _httpClient.PostAsJsonAsync($"{_baseUrl}/api/control", payload);
+            using HttpRequestMessage request = CreateJsonRequest(HttpMethod.Post, $"{_baseUrl}/api/control", payload);
+            using HttpResponseMessage resp = await _httpClient.SendAsync(request);
             resp.EnsureSuccessStatusCode();
             await PollStatusAsync();
         }
@@ -289,7 +308,8 @@ public partial class MainWindow : Window
 
         try
         {
-            using HttpResponseMessage resp = await _httpClient.GetAsync($"{_baseUrl}/api/status");
+            using HttpRequestMessage request = CreateRequest(HttpMethod.Get, $"{_baseUrl}/api/status");
+            using HttpResponseMessage resp = await _httpClient.SendAsync(request);
             resp.EnsureSuccessStatusCode();
             string json = await resp.Content.ReadAsStringAsync();
 
@@ -306,10 +326,7 @@ public partial class MainWindow : Window
         {
             if (_pollTimer.IsEnabled)
             {
-                _pollTimer.Stop();
-                ConnectButton.IsEnabled = true;
-                DisconnectButton.IsEnabled = false;
-                AddressTextBox.IsEnabled = true;
+                DisconnectLan();
             }
 
             SetConnectedVisuals(false, "LAN: 连接中断");
@@ -327,14 +344,75 @@ public partial class MainWindow : Window
         RemainingText.Text = status.remaining_hms;
 
         string runState = status.active ? "运行中" : "已停止";
-        RunStateText.Text = $"运行状态: {runState} | 预设: {status.preset} | 加热: {status.heater_pct}% | 风扇PWM: {status.fan_pct}% | 风扇转速: {status.fan_rpm} RPM";
+        string presetText = string.IsNullOrWhiteSpace(status.active_custom_preset_name) ? status.preset : $"{status.preset} / {status.active_custom_preset_name}";
+        RunStateText.Text = $"运行状态: {runState} | 配方: {presetText} | 加热: {status.heater_pct}% | 风扇PWM: {status.fan_pct}% | 风扇转速: {status.fan_rpm} RPM";
 
         string wifiState = status.wifi_connected ? "已连接路由器" : (status.ap_mode ? "AP 配网模式" : "离线");
-        NetworkText.Text = $"网络: {wifiState} | IP: {status.ip}";
+        string tokenState = status.auth_enabled ? "Token 已启用" : "Token 未启用";
+        NetworkText.Text = $"网络: {wifiState} | IP: {status.ip} | MQTT: {(status.mqtt_connected ? "已连接" : "未连接")} | {tokenState}";
 
-        FaultText.Text = $"故障标志: {status.fault} | PID 自整定: {(status.pid_autotune ? "进行中" : status.pid_autotune_msg)} ({status.pid_autotune_progress}%)";
-        DataSourceText.Text = $"数据来源: {source}";
+        string faultText = string.IsNullOrWhiteSpace(status.fault_text)
+            ? (status.fault == 0 ? "无故障" : $"故障码 {status.fault}")
+            : status.fault_text;
+        FaultText.Text = $"故障: {faultText} (代码 {status.fault}) | PID 自整定: {(status.pid_autotune ? "进行中" : status.pid_autotune_msg)} ({status.pid_autotune_progress}%) | 湿度停机: {status.humidity_stop_pct:F1}% | 风扇范围: {status.custom_fan_base_pct}%~{status.custom_fan_max_pct}%";
+        DataSourceText.Text = $"数据来源: {source} | 通知: {(status.notify_enabled ? "启用" : "关闭")} | OTA: {status.ota_last_msg}";
         RawJsonTextBox.Text = PrettyPrintJson(rawJson);
+    }
+
+    private HttpRequestMessage CreateRequest(HttpMethod method, string url)
+    {
+        var request = new HttpRequestMessage(method, url);
+        string token = WebTokenTextBox.Text.Trim();
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            request.Headers.TryAddWithoutValidation("X-Dryer-Token", token);
+        }
+
+        return request;
+    }
+
+    private HttpRequestMessage CreateJsonRequest(HttpMethod method, string url, object payload)
+    {
+        var request = CreateRequest(method, url);
+        request.Content = JsonContent.Create(payload);
+        return request;
+    }
+
+    private static string NormalizeBemfaTopicBase(string raw)
+    {
+        string value = raw.Trim().TrimEnd('/');
+        if (value.EndsWith("/set", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value[..^4];
+        }
+        else if (value.EndsWith("/up", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value[..^3];
+        }
+
+        return value.TrimEnd('/');
+    }
+
+    private static string BuildStatusTopic(string baseTopic) => NormalizeBemfaTopicBase(baseTopic);
+
+    private static string BuildControlTopic(string baseTopic) => $"{NormalizeBemfaTopicBase(baseTopic)}/set";
+
+    private static bool IsBemfaTopicBase(string topic)
+    {
+        if (string.IsNullOrWhiteSpace(topic))
+        {
+            return false;
+        }
+
+        foreach (char c in topic)
+        {
+            if (!char.IsLetterOrDigit(c))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static string PrettyPrintJson(string raw)
@@ -353,12 +431,24 @@ public partial class MainWindow : Window
     {
         ConnectionStateText.Text = text;
         ConnectionStateText.Foreground = connected ? new SolidColorBrush(Color.FromRgb(74, 222, 128)) : new SolidColorBrush(Color.FromRgb(245, 158, 11));
+        UpdateLanButtonState(connected);
     }
 
     private void SetMqttVisuals(bool connected, string text)
     {
         MqttStateText.Text = text;
         MqttStateText.Foreground = connected ? new SolidColorBrush(Color.FromRgb(74, 222, 128)) : new SolidColorBrush(Color.FromRgb(245, 158, 11));
+        UpdateMqttButtonState(connected);
+    }
+
+    private void UpdateLanButtonState(bool connected)
+    {
+        ConnectButton.Content = connected ? "断开 LAN" : "连接 LAN";
+    }
+
+    private void UpdateMqttButtonState(bool connected)
+    {
+        MqttConnectButton.Content = connected ? "断开 MQTT" : "连接 MQTT";
     }
 
     protected override async void OnClosed(EventArgs e)
@@ -403,5 +493,14 @@ public partial class MainWindow : Window
         bool ap_mode,
         string ip,
         double idle_temp_c = 0,
-        int fan_rpm = 0);
+        int fan_rpm = 0,
+        bool mqtt_connected = false,
+        bool notify_enabled = false,
+        string ota_last_msg = "",
+        double humidity_stop_pct = 0,
+        int custom_fan_base_pct = 0,
+        int custom_fan_max_pct = 0,
+        string active_custom_preset_name = "",
+        bool auth_enabled = false,
+        string fault_text = "");
 }
